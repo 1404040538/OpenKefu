@@ -1,0 +1,67 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8000,
+    "frontend_dist": "web/dist"
+  },
+  "mysql": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "openkefu",
+    "password": "CHANGE_ME",
+    "database": "openkefu",
+    "charset": "utf8mb4",
+    "pool_size": 8,
+    "ssl_ca": "",
+    "ssl_cert": "",
+    "ssl_key": "",
+    "ssl_verify_identity": true
+  },
+  "redis": {
+    "url": "redis://127.0.0.1:6379/0"
+  },
+  "runtime": {
+    "role": "both",
+    "worker_id": "",
+    "lease_ttl_seconds": 45,
+    "reply_workers": 16,
+    "command_secret": "CHANGE_ME_32+_CHARS_RANDOM"
+  },
+  "security": {
+    "jwt_secret": "CHANGE_ME_32+_CHARS_RANDOM",
+    "data_encryption_key": "CHANGE_ME_32+_CHARS_RANDOM",
+    "jwt_expire_minutes": 10080,
+    "allowed_origins": [],
+    "rate_limit_disabled": false
+  },
+  "logging": {
+    "path": "logs/openkefu_web.log",
+    "level": "INFO"
+  },
+  "llm": {
+    "api_key": "",
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-v4-flash"
+  },
+  "embedding": {
+    "api_key": "",
+    "base_url": "",
+    "model": ""
+  },
+  "vector_store": {
+    "provider": "mysql",
+    "path": "",
+    "collection": "openkefu_knowledge"
+  },
+  "storage": {
+    "knowledge_dir": "data/knowledge_files"
+  },
+  "server_status": {
+    "enabled": true,
+    "collect_interval_seconds": 5,
+    "persist_interval_seconds": 30,
+    "raw_retention_days": 7,
+    "rollup_retention_days": 30,
+    "top_process_limit": 8
+  }
+}

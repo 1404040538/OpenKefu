@@ -1,0 +1,14 @@
+bind 127.0.0.1 ::1
+protected-mode yes
+port 6379
+daemonize no
+supervised systemd
+
+# Copy redis-users.acl.example outside the repository, replace the password,
+# set permissions to 0600, and point this path at that private file.
+aclfile /etc/openkefu/redis-users.acl
+
+appendonly yes
+save 900 1
+save 300 10
+save 60 10000

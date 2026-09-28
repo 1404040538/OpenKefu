@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenKefu Test Redis
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/redis-server /home/deploy/openkefu-test-deploy/shared/redis.conf
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
+

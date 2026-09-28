@@ -1,0 +1,19 @@
+[Unit]
+Description=OpenKefu Test Runtime Worker
+After=network.target mysql.service openkefu-test-redis.service openkefu-test-api.service
+Requires=openkefu-test-redis.service openkefu-test-api.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/deploy/openkefu-test-deploy/current
+Environment=PYTHONUNBUFFERED=1
+Environment=OPENKEFU_RUNTIME_ROLE=worker
+Environment=OPENKEFU_RUNTIME_WORKER_ID=openkefu-test-runtime-1
+ExecStart=/home/deploy/openkefu-test-deploy/current/.venv/bin/python /home/deploy/openkefu-test-deploy/current/run_runtime_worker.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
+

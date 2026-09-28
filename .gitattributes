@@ -1,0 +1,3 @@
+deploy/test-ops/bin/* text eol=lf
+deploy/test-ops/systemd/* text eol=lf
+deploy/test-ops/redis/* text eol=lf

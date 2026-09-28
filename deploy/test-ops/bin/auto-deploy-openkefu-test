@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+BASE=/home/deploy/openkefu-test-deploy
+SOURCE_REPO=/home/deploy/OPENKEFU_agent_test
+BRANCH=${OPENKEFU_TEST_BRANCH:-main}
+DEPLOY=/home/deploy/bin/deploy-openkefu-test
+LOG="$BASE/shared/auto-deploy.log"
+
+mkdir -p "$BASE/shared"
+exec 8>"$BASE/auto-deploy.lock"
+if ! flock -n 8; then
+  echo "[$(date --iso-8601=seconds)] previous auto deploy check still running; skip" >>"$LOG"
+  exit 0
+fi
+
+exec >>"$LOG" 2>&1
+
+echo "[$(date --iso-8601=seconds)] auto deploy check started"
+
+if [[ ! -d "$SOURCE_REPO/.git" ]]; then
+  echo "source repo missing: $SOURCE_REPO"
+  exit 1
+fi
+
+if [[ ! -x "$DEPLOY" ]]; then
+  echo "deploy script not executable: $DEPLOY"
+  exit 1
+fi
+
+git -C "$SOURCE_REPO" fetch --prune origin "$BRANCH"
+
+remote_commit="$(git -C "$SOURCE_REPO" rev-parse "origin/$BRANCH")"
+deployed_commit=""
+
+if [[ -f "$BASE/current/REVISION" ]]; then
+  deployed_commit="$(tr -d '[:space:]' < "$BASE/current/REVISION")"
+fi
+
+echo "remote=$remote_commit deployed=$deployed_commit"
+
+if [[ "$remote_commit" == "$deployed_commit" ]]; then
+  echo "already up to date"
+  exit 0
+fi
+
+echo "new commit detected, deploying..."
+OPENKEFU_DEPLOY_ENV=test "$DEPLOY"

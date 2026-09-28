@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HEALTH_URL=${OPENKEFU_TEST_HEALTH_URL:-http://127.0.0.1:18000/api/auth/status}
+
+for _ in $(seq 1 60); do
+  if /usr/bin/curl --fail --silent --max-time 3 "$HEALTH_URL" >/dev/null; then
+    exit 0
+  fi
+  sleep 2
+done
+
+echo "OpenKefu test API health check timed out" >&2
+exit 1
+

@@ -1,0 +1,2 @@
+user default off
+user openkefu on >REPLACE_WITH_AT_LEAST_32_RANDOM_CHARACTERS ~openkefu:* &openkefu:* +@pubsub +ping

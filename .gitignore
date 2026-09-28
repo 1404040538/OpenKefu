@@ -1,0 +1,44 @@
+# ===== 运行时数据 =====
+# config.local.json 含 MySQL 口令与大模型 API Key，严禁入库；模板见 config.example.json
+config.local.json
+logs/
+data/
+qrcodes/
+temp/
+output
+*.log
+
+# ===== 前端构建产物 =====
+web/node_modules/
+web/dist/
+.npm-cache/
+
+# ===== Python 运行时 =====
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# ===== JS 逆向/分析产物（不入库） =====
+web_source_js/
+wen_source_js/
+temp_api/
+# 注意：openkefu/platforms/pdd/auth/login_js/0.5c978353.chunk.*.js 是 anti_content.js 的运行时依赖，必须入库，不能忽略
+
+# ===== IDE / 工具目录 =====
+.idea/
+*.iml
+.vscode/
+.trae/
+.claude/
+.reasonix/
+
+# ===== 测试/部署产物 =====
+# 忽略名称含 test 的目录/文件，但保留 deploy/test-ops 部署骨架与 checks/ 测试脚本
+*test*
+!checks/
+!checks/**
+!deploy/test-ops/
+!deploy/test-ops/**

@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Compile check
+        run: python -m compileall -q openkefu run_web.py run_runtime_worker.py main.py
+      - name: Offline unit tests
+        env:
+          PYTHONPATH: .
+        run: |
+          python checks/intent_prompt_unit.py
+          python checks/security_unit.py
+          python checks/server_status_unit.py
+          python checks/return_records_unit.py
+          python checks/reply_cache_unit.py
+          python checks/chat_transport_unit.py
+          python checks/db_pool_unit.py
+          python checks/realtime_unit.py
+          python checks/run_web_unit.py
+          python checks/frontend_contract_unit.py
+          python checks/send_recovery_unit.py
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Build
+        run: npm run build

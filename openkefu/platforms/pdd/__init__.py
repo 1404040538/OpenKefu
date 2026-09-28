@@ -1,0 +1,1 @@
+"""Pinduoduo (PDD) platform adapter."""

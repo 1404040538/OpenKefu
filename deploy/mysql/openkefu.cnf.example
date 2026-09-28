@@ -1,0 +1,9 @@
+[mysqld]
+# Keep a same-host database private. For a remote database, use a private
+# network, enable require_secure_transport, and configure mysql.ssl_ca in the app.
+bind-address = 127.0.0.1
+skip-name-resolve = ON
+local-infile = OFF
+
+[client]
+protocol = TCP

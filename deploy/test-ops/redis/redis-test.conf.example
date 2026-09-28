@@ -1,0 +1,14 @@
+bind 127.0.0.1
+protected-mode yes
+port 16379
+daemonize no
+supervised no
+dir /home/deploy/openkefu-test-deploy/shared/redis
+dbfilename dump.rdb
+appendonly yes
+appendfilename appendonly.aof
+logfile ""
+save 900 1
+save 300 10
+save 60 10000
+

@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenKefu Runtime Worker
+After=network.target mysql.service redis.service
+
+[Service]
+WorkingDirectory=/opt/openkefu
+Environment=OPENKEFU_RUNTIME_ROLE=worker
+Environment=OPENKEFU_RUNTIME_WORKER_ID=%H-runtime-1
+ExecStart=/opt/openkefu/.venv/bin/python run_runtime_worker.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

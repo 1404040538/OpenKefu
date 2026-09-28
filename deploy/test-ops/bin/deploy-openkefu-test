@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+BASE=${OPENKEFU_TEST_DEPLOY_BASE:-/home/deploy/openkefu-test-deploy}
+SOURCE_REPO=${OPENKEFU_TEST_SOURCE_REPO:-/home/deploy/OPENKEFU_agent_test}
+BRANCH=${OPENKEFU_TEST_BRANCH:-main}
+KEEP_RELEASES=${OPENKEFU_TEST_KEEP_RELEASES:-5}
+HEALTH_URL=${OPENKEFU_TEST_HEALTH_URL:-http://127.0.0.1:18000/api/auth/status}
+DEPLOY_ENV=${OPENKEFU_DEPLOY_ENV:-test}
+LOCAL_ONLY=0
+
+if [[ "${1:-}" == "--local" ]]; then
+  LOCAL_ONLY=1
+elif [[ -n "${1:-}" ]]; then
+  echo "Usage: $0 [--local]" >&2
+  exit 2
+fi
+
+mkdir -p "$BASE/releases" "$BASE/shared/logs"
+exec 9>"$BASE/deploy.lock"
+if ! flock -n 9; then
+  echo "Another deployment is running." >&2
+  exit 1
+fi
+
+exec > >(tee -a "$BASE/shared/deploy.log") 2>&1
+echo "[$(date --iso-8601=seconds)] deploy started"
+echo "Deploy environment: $DEPLOY_ENV"
+
+if [[ "$DEPLOY_ENV" != "test" ]]; then
+  echo "This script is test-only. Refusing to auto-sync or restart non-test environment: $DEPLOY_ENV" >&2
+  exit 2
+fi
+
+if [[ ! -d "$SOURCE_REPO/.git" ]]; then
+  echo "Source repository missing: $SOURCE_REPO" >&2
+  exit 1
+fi
+
+if (( LOCAL_ONLY )); then
+  commit=$(git -C "$SOURCE_REPO" rev-parse "$BRANCH")
+  echo "Using local $BRANCH at $commit"
+else
+  git -C "$SOURCE_REPO" fetch --prune origin "$BRANCH"
+  commit=$(git -C "$SOURCE_REPO" rev-parse "origin/$BRANCH")
+  git -C "$SOURCE_REPO" checkout -q "$BRANCH"
+  git -C "$SOURCE_REPO" reset --hard -q "$commit"
+  echo "Using origin/$BRANCH at $commit"
+fi
+
+short_commit=$(git -C "$SOURCE_REPO" rev-parse --short=12 "$commit")
+release_name="$(date +%Y%m%d%H%M%S)-$short_commit"
+release="$BASE/releases/$release_name"
+staging="$BASE/releases/.building-$release_name"
+previous=""
+
+cleanup() {
+  if [[ -d "$staging" ]]; then
+    rm -rf -- "$staging"
+  fi
+}
+trap cleanup EXIT
+
+mkdir "$staging"
+git -C "$SOURCE_REPO" archive "$commit" | tar -x -C "$staging"
+
+rm -rf -- "$staging/config.local.json" "$staging/logs" "$staging/data" "$staging/qrcodes"
+ln -s "$BASE/shared/config.local.json" "$staging/config.local.json"
+ln -s "$BASE/shared/logs" "$staging/logs"
+ln -s "$BASE/shared/data" "$staging/data"
+ln -s "$BASE/shared/qrcodes" "$staging/qrcodes"
+
+python3 -m venv "$staging/.venv"
+"$staging/.venv/bin/python" -m pip install --disable-pip-version-check -r "$staging/requirements.txt"
+(
+  cd "$staging/web"
+  npm ci --no-audit --no-fund
+  npm run build
+)
+"$staging/.venv/bin/python" -m compileall -q "$staging/openkefu" "$staging/run_web.py" "$staging/run_runtime_worker.py"
+if [[ -f "$staging/checks/return_records_unit.py" ]]; then
+  PYTHONPATH="$staging" "$staging/.venv/bin/python" "$staging/checks/return_records_unit.py"
+fi
+
+printf '%s\n' "$commit" > "$staging/REVISION"
+mv "$staging" "$release"
+
+if [[ -L "$BASE/current" ]]; then
+  previous=$(readlink -f "$BASE/current")
+fi
+ln -s "$release" "$BASE/current.next"
+mv -Tf "$BASE/current.next" "$BASE/current"
+
+rollback() {
+  echo "Health check failed; rolling back."
+  if [[ -n "$previous" && -d "$previous" ]]; then
+    ln -s "$previous" "$BASE/current.rollback"
+    mv -Tf "$BASE/current.rollback" "$BASE/current"
+    systemctl --user stop openkefu-test-worker.service || true
+    systemctl --user restart openkefu-test-api.service || true
+    systemctl --user restart openkefu-test-worker.service || true
+  else
+    systemctl --user stop openkefu-test-worker.service openkefu-test-api.service || true
+  fi
+  if [[ -n "${release:-}" && -d "$release" && "$(readlink -f "$BASE/current" 2>/dev/null || true)" != "$(readlink -f "$release")" ]]; then
+    rm -rf -- "$release"
+  fi
+}
+trap rollback ERR
+
+systemctl --user stop openkefu-test-worker.service openkefu-test-api.service || true
+systemctl --user restart openkefu-test-redis.service
+systemctl --user start openkefu-test-api.service
+systemctl --user start openkefu-test-worker.service
+
+healthy=0
+for _ in $(seq 1 30); do
+  if curl --fail --silent --show-error --max-time 3 "$HEALTH_URL" >/dev/null; then
+    healthy=1
+    break
+  fi
+  sleep 2
+done
+if (( ! healthy )); then
+  journalctl --user -u openkefu-test-api.service -n 40 --no-pager || true
+  false
+fi
+
+systemctl --user is-active --quiet openkefu-test-redis.service
+systemctl --user is-active --quiet openkefu-test-api.service
+systemctl --user is-active --quiet openkefu-test-worker.service
+
+trap - ERR
+mapfile -t releases < <(find "$BASE/releases" -mindepth 1 -maxdepth 1 -type d ! -name '.building-*' -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
+if (( ${#releases[@]} > KEEP_RELEASES )); then
+  for old in "${releases[@]:KEEP_RELEASES}"; do
+    if [[ "$(readlink -f "$BASE/current")" != "$old" ]]; then
+      rm -rf -- "$old"
+    fi
+  done
+fi
+
+echo "[$(date --iso-8601=seconds)] deploy succeeded: $release_name"
+echo "URL: http://<server-lan-ip>:18000"
