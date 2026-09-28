@@ -8,33 +8,7 @@ from openkefu.platforms.pdd.chat.intent import build_intent_messages, normalize_
 from openkefu.platforms.pdd.chat.llm import LLMClient, get_llm_client
 from openkefu.web.config import LLMConfig
 
-DEFAULT_SYSTEM_PROMPT = (
-    "你是拼多多店铺客服。请用自然、耐心、简洁的中文回复顾客。"
-    "如果信息不足，先礼貌追问；不要编造订单、物流、售后结果。"
-)
-
 FALLBACK_REPLY = "亲，这个问题我先帮您记录下来，会尽快安排人工客服继续处理，请您稍等一下。"
-
-
-def generate_customer_service_reply(
-    history: list[dict[str, str]],
-    *,
-    model: str | None = None,
-    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-    llm_config: LLMConfig | None = None,
-) -> str:
-    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
-    messages.extend(_normalize_history(history))
-    if len(messages) == 1:
-        raise ValueError("大模型回复缺少对话内容")
-
-    client = _resolve_client(llm_config)
-    return client.chat(
-        messages,
-        model=model or client.model,
-        max_tokens=512,
-        max_retries=1,
-    )
 
 
 def analyze_customer_intent(

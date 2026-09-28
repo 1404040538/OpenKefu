@@ -31,7 +31,6 @@ from openkefu.platforms.pdd.chat.goods import GoodsService
 from openkefu.platforms.pdd.chat.intent import clean_reply_text
 from openkefu.platforms.pdd.chat.knowledge import KnowledgeService, NoteSetService
 from openkefu.platforms.pdd.chat.llm import LLMClient, get_llm_client
-from openkefu.platforms.pdd.chat.llm_reply import analyze_customer_intent
 from openkefu.platforms.pdd.chat.orders import OrderService
 from openkefu.platforms.pdd.chat.reply_cache import ReplyCache
 from openkefu.platforms.pdd.chat.return_records import ReturnRecordService
