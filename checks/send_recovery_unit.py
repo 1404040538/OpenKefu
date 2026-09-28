@@ -34,6 +34,9 @@ def runner_stub():
     runner.db = Mock()
     runner.db.execute.return_value = 12
     runner.db.query_one.return_value = {"id": 10, "user_uid": "user-1", "conv_id": "conv-1"}
+    # 数据访问已收敛到 repositories：stub 注入与 db 行为一致的 repos
+    from openkefu.web.repositories import Repositories
+    runner.repos = Repositories(runner.db)
     runner.runtime_logger = Mock()
     runner.hub = Mock()
     for name in (
@@ -73,7 +76,6 @@ class SendPolicyTest(unittest.TestCase):
 class SendRecoveryTest(unittest.TestCase):
     def test_online_returns_pending_verification_instead_of_session_error(self):
         runner = runner_stub()
-        runner._require_creator_llm_quota = Mock()
         challenge = {
             "status": "verification_required",
             "need_verify": True,
@@ -141,7 +143,11 @@ class SendRecoveryTest(unittest.TestCase):
         result = runner.send_reply(conversation_id=10, content="test reply")
         self.assertEqual(result["msg_id"], "remote-1")
         self.assertEqual(runner.customer_service.send_text_message.call_count, 1)
-        self.assertTrue(any("status='sent'" in c.args[0] for c in runner.db.execute.call_args_list))
+        # update_message 参数化执行：SQL 含 UPDATE messages 且参数里带 "sent"
+        self.assertTrue(any(
+            "UPDATE messages SET" in c.args[0] and any(p == "sent" for p in (c.args[1] if len(c.args) > 1 else ()))
+            for c in runner.db.execute.call_args_list
+        ))
 
     def test_rejected_text_refreshes_once_and_reuses_idempotency_key(self):
         runner = runner_stub()

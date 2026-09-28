@@ -44,7 +44,6 @@ class LocalApiE2ETest(unittest.TestCase):
             mysql=replace(base_config.mysql, database=TEST_DATABASE),
             runtime=replace(base_config.runtime, role="both", worker_id="e2e-local-worker"),
             logging=replace(base_config.logging, path="logs/e2e_local_test.log"),
-            server_status=replace(base_config.server_status, enabled=False),
         )
         cls._drop_test_database()
 
@@ -178,9 +177,6 @@ class LocalApiE2ETest(unittest.TestCase):
                 "display_name": "E2E Service",
                 "role": "service",
                 "shop_ids": [shop_id],
-                "max_shops": 2,
-                "max_knowledge_bases": 2,
-                "max_llm_replies": 10,
             },
         )
         self._assert_response(response, 200)

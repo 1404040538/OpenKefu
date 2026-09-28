@@ -278,13 +278,10 @@ class RuntimeLogger:
         self._worker.start()
 
     def _flush_loop(self) -> None:
+        # SQL 定义收敛在 RuntimeLogsRepository（延迟导入避免循环依赖）
+        from openkefu.web.repositories.logs import LOG_INSERT_SQL as sql
+
         batch: list[tuple[Any, ...]] = []
-        sql = """
-            INSERT INTO runtime_logs
-            (level, module, action, message, shop_id, mall_id, conversation_id,
-             user_uid, request_id, run_id, pid, error_trace, context_json)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """
         while True:
             try:
                 item = self._queue.get(timeout=0.5)

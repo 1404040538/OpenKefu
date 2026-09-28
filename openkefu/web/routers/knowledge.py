@@ -9,6 +9,13 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+MAX_UPLOAD_FILE_BYTES = 20 * 1024 * 1024
+
+
+def validate_upload_size(data: bytes) -> None:
+    if len(data) > MAX_UPLOAD_FILE_BYTES:
+        raise HTTPException(status_code=400, detail="文件大小不能超过 20MB")
+
 
 class KnowledgeBaseCreate(BaseModel):
     name: str
@@ -85,7 +92,6 @@ def build_router(ctx) -> APIRouter:
         if not body.name.strip():
             raise HTTPException(status_code=400, detail="knowledge base name is required")
         ctx.ensure_shop_ids_manageable(user, body.shop_ids)
-        ctx.ensure_user_can_create_knowledge_base(user)
         return ctx.knowledge.create_knowledge_base(
             name=body.name,
             description=body.description,
@@ -132,7 +138,7 @@ def build_router(ctx) -> APIRouter:
     async def upload_knowledge_file(kb_id: int, request: Request, user: dict[str, Any] = Depends(ctx.current_user)):
         ctx.ensure_knowledge_base_manageable(kb_id, user)
         filename, content_type, data = await read_single_upload(request)
-        ctx.ensure_user_can_upload_knowledge_file(user, kb_id, data)
+        validate_upload_size(data)
         try:
             return await asyncio.to_thread(
                 ctx.knowledge.upload_file_bytes,

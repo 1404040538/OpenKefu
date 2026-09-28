@@ -20,7 +20,6 @@ from openkefu.web.realtime import RealtimeHub, RuntimeLogger
 from openkefu.web.routers import auth, chat, knowledge, logs, return_records, shops, status, users
 from openkefu.web.runtime import ShopRuntimeManager
 from openkefu.web.security import decode_token
-from openkefu.web.server_status import ServerStatusCollector
 
 WS_AUTH_PROTOCOL_PREFIX = "openkefu-auth."
 
@@ -44,7 +43,6 @@ def create_app() -> FastAPI:
     hub = RealtimeHub(config)
     runtime_logger = RuntimeLogger(db, hub)
     runtime = ShopRuntimeManager(db, hub, runtime_logger, config)
-    server_status = ServerStatusCollector(db, hub, runtime_logger, config)
     knowledge = KnowledgeService(db, config)
     note_service = NoteSetService(db)
 
@@ -54,7 +52,6 @@ def create_app() -> FastAPI:
         hub=hub,
         runtime_logger=runtime_logger,
         runtime=runtime,
-        server_status=server_status,
         knowledge=knowledge,
         note_service=note_service,
     )
@@ -64,11 +61,9 @@ def create_app() -> FastAPI:
         await hub.start()
         if config.runtime.role in {"worker", "both"}:
             runtime.start_background_services()
-        server_status.start()
         try:
             yield
         finally:
-            server_status.stop()
             runtime.stop_background_services()
             ctx.offline_pool.shutdown(wait=False)
             await hub.stop()
@@ -79,7 +74,6 @@ def create_app() -> FastAPI:
     app.state.hub = hub
     app.state.runtime_logger = runtime_logger
     app.state.runtime = runtime
-    app.state.server_status = server_status
     app.state.knowledge = knowledge
     app.state.note_service = note_service
 

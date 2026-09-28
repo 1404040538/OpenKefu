@@ -1,13 +1,12 @@
 import { useState } from "react";
 import { Bot, Loader2, Play, Plus, Settings, Trash2, Wifi, WifiOff } from "lucide-react";
-import type { Quota, Shop } from "../types/types";
+import type { Shop } from "../types/types";
 import { StatusBadge } from "./StatusBadge";
 import { LOGIN_FINISHED_STATUSES } from "../utils/constants";
 import { usePendingActions } from "../utils/usePendingActions";
 
 export function ShopPage({
   shops,
-  quota,
   selectedShopId,
   onSelect,
   onCreate,
@@ -20,7 +19,6 @@ export function ShopPage({
   onOpenTransferSettings,
 }: {
   shops: Shop[];
-  quota: Quota | null;
   selectedShopId: number | null;
   onSelect: (id: number) => void;
   onCreate: (body: any) => Promise<void>;
@@ -38,30 +36,17 @@ export function ShopPage({
   const [deleteTarget, setDeleteTarget] = useState<Shop | null>(null);
   const { isPending, runAction } = usePendingActions();
 
-  const maxShops = quota?.max_shops ?? null;
-  const canCreate = maxShops == null || shops.length < maxShops;
   const createPending = isPending("shop-create");
   const deletePending = deleteTarget ? isPending(`shop-delete-${deleteTarget.id}`) : false;
   return (
     <div className="page shop-page">
       <div className="page-header">
-        {canCreate && (
-          <button className="btn btn-primary" onClick={() => setShowCreate(true)}>
-            <Plus size={16} /> 新建店铺
-          </button>
-        )}
+        <button className="btn btn-primary" onClick={() => setShowCreate(true)}>
+          <Plus size={16} /> 新建店铺
+        </button>
       </div>
 
       <div className="shop-grid">
-        {!canCreate && (
-          <div className="shop-card shop-card-disabled">
-            <div className="shop-card-icon"><Plus size={22} /></div>
-            <div className="shop-card-body">
-              <strong>店铺数量已达上限</strong>
-              <span>当前 {shops.length}/{maxShops ?? 0}，暂不可新建店铺</span>
-            </div>
-          </div>
-        )}
         {shops.map((shop) => (
           <article
             key={shop.id}

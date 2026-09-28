@@ -41,16 +41,7 @@ def build_router(ctx: AppContext) -> APIRouter:
         offset: int = Query(default=0, ge=0),
     ):
         ctx.can_access_shop(user, shop_id)
-        return ctx.db.query(
-            f"""
-            {ctx.conversation_select_sql()}
-            WHERE c.shop_id=%s AND c.user_uid <> 'unknown'
-              AND s.mall_id IS NOT NULL AND c.mall_id <=> s.mall_id
-            {ctx.conversation_order_sql()}
-            LIMIT %s OFFSET %s
-            """,
-            (shop_id, limit, offset),
-        )
+        return ctx.repos.conversations.list_for_shop(shop_id, limit=limit, offset=offset)
 
     @router.get("/api/conversations")
     def all_conversations(
@@ -61,38 +52,10 @@ def build_router(ctx: AppContext) -> APIRouter:
     ):
         if shop_id:
             ctx.can_access_shop(user, shop_id)
-            return ctx.db.query(
-                f"""
-                {ctx.conversation_select_sql()}
-                WHERE c.shop_id=%s AND c.user_uid <> 'unknown'
-                  AND s.mall_id IS NOT NULL AND c.mall_id <=> s.mall_id
-                {ctx.conversation_order_sql()}
-                LIMIT %s OFFSET %s
-                """,
-                (shop_id, limit, offset),
-            )
+            return ctx.repos.conversations.list_for_shop(shop_id, limit=limit, offset=offset)
         if user["role"] == "admin":
-            return ctx.db.query(
-                f"""
-                {ctx.conversation_select_sql()}
-                WHERE c.user_uid <> 'unknown'
-                  AND s.mall_id IS NOT NULL AND c.mall_id <=> s.mall_id
-                {ctx.conversation_order_sql()}
-                LIMIT %s OFFSET %s
-                """,
-                (limit, offset),
-            )
-        return ctx.db.query(
-            f"""
-            {ctx.conversation_select_sql()}
-            JOIN shop_assignments sa ON sa.shop_id=s.id
-            WHERE sa.user_id=%s AND c.user_uid <> 'unknown'
-              AND s.mall_id IS NOT NULL AND c.mall_id <=> s.mall_id
-            {ctx.conversation_order_sql()}
-            LIMIT %s OFFSET %s
-            """,
-            (user["id"], limit, offset),
-        )
+            return ctx.repos.conversations.list_all_admin(limit=limit, offset=offset)
+        return ctx.repos.conversations.list_all_for_user(int(user["id"]), limit=limit, offset=offset)
 
     @router.get("/api/shops/{shop_id}/transfer-services")
     def transfer_services(shop_id: int, user: dict[str, Any] = Depends(ctx.current_user)):
@@ -109,28 +72,16 @@ def build_router(ctx: AppContext) -> APIRouter:
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
     ):
-        conversation = ctx.db.query_one("SELECT * FROM conversations WHERE id=%s", (conversation_id,))
+        conversation = ctx.repos.conversations.by_id_plain(conversation_id)
         if not conversation:
             raise HTTPException(status_code=404, detail="conversation not found")
         ctx.can_access_shop(user, int(conversation["shop_id"]))
         ctx.ensure_current_conversation(conversation)
-        return ctx.db.query(
-            """
-            SELECT * FROM (
-                SELECT * FROM messages
-                WHERE conversation_id=%s
-                  AND NOT (direction='system' AND COALESCE(content, '')='')
-                ORDER BY id DESC
-                LIMIT %s OFFSET %s
-            ) recent_messages
-            ORDER BY id ASC
-            """,
-            (conversation_id, limit, offset),
-        )
+        return ctx.repos.conversations.messages_page(conversation_id, limit=limit, offset=offset)
 
     @router.get("/api/conversations/{conversation_id}/context")
     def conversation_context(conversation_id: int, user: dict[str, Any] = Depends(ctx.current_user)):
-        conversation = ctx.db.query_one("SELECT * FROM conversations WHERE id=%s", (conversation_id,))
+        conversation = ctx.repos.conversations.by_id_plain(conversation_id)
         if not conversation:
             raise HTTPException(status_code=404, detail="conversation not found")
         ctx.can_access_shop(user, int(conversation["shop_id"]))
@@ -142,7 +93,7 @@ def build_router(ctx: AppContext) -> APIRouter:
 
     @router.post("/api/conversations/{conversation_id}/reply")
     def reply(conversation_id: int, body: ReplyRequest, user: dict[str, Any] = Depends(ctx.current_user)):
-        conversation = ctx.db.query_one("SELECT * FROM conversations WHERE id=%s", (conversation_id,))
+        conversation = ctx.repos.conversations.by_id_plain(conversation_id)
         if not conversation:
             raise HTTPException(status_code=404, detail="conversation not found")
         ctx.can_access_shop(user, int(conversation["shop_id"]))
@@ -154,7 +105,7 @@ def build_router(ctx: AppContext) -> APIRouter:
 
     @router.post("/api/conversations/{conversation_id}/reply-image")
     def reply_image(conversation_id: int, body: ReplyImageRequest, user: dict[str, Any] = Depends(ctx.current_user)):
-        conversation = ctx.db.query_one("SELECT * FROM conversations WHERE id=%s", (conversation_id,))
+        conversation = ctx.repos.conversations.by_id_plain(conversation_id)
         if not conversation:
             raise HTTPException(status_code=404, detail="conversation not found")
         ctx.can_access_shop(user, int(conversation["shop_id"]))
@@ -175,7 +126,7 @@ def build_router(ctx: AppContext) -> APIRouter:
 
     @router.post("/api/conversations/{conversation_id}/transfer")
     def transfer(conversation_id: int, body: TransferRequest, user: dict[str, Any] = Depends(ctx.current_user)):
-        conversation = ctx.db.query_one("SELECT * FROM conversations WHERE id=%s", (conversation_id,))
+        conversation = ctx.repos.conversations.by_id_plain(conversation_id)
         if not conversation:
             raise HTTPException(status_code=404, detail="conversation not found")
         ctx.can_access_shop(user, int(conversation["shop_id"]))
@@ -187,43 +138,24 @@ def build_router(ctx: AppContext) -> APIRouter:
 
     @router.patch("/api/conversations/{conversation_id}/bot-reply")
     def update_conversation_bot_reply(conversation_id: int, body: ConversationBotReplyUpdate, user: dict[str, Any] = Depends(ctx.current_user)):
-        conversation = ctx.db.query_one("SELECT * FROM conversations WHERE id=%s", (conversation_id,))
+        conversation = ctx.repos.conversations.by_id_plain(conversation_id)
         if not conversation:
             raise HTTPException(status_code=404, detail="conversation not found")
         ctx.can_access_shop(user, int(conversation["shop_id"]))
         ctx.ensure_current_conversation(conversation)
-        ctx.db.execute(
-            """
-            UPDATE conversations
-            SET bot_reply_enabled=%s,
-                human_attention_required=IF(%s=1, 0, human_attention_required),
-                human_attention_reason=IF(%s=1, NULL, human_attention_reason),
-                human_attention_at=IF(%s=1, NULL, human_attention_at)
-            WHERE id=%s
-            """,
-            (int(body.enabled), int(body.enabled), int(body.enabled), int(body.enabled), conversation_id),
-        )
+        ctx.repos.conversations.set_bot_reply(conversation_id, body.enabled)
         ctx.publish_conversation(conversation_id)
-        return ctx.conversation_row(conversation_id)
+        return ctx.repos.conversations.row(conversation_id)
 
     @router.post("/api/conversations/{conversation_id}/clear-attention")
     def clear_conversation_attention(conversation_id: int, user: dict[str, Any] = Depends(ctx.current_user)):
-        conversation = ctx.db.query_one("SELECT * FROM conversations WHERE id=%s", (conversation_id,))
+        conversation = ctx.repos.conversations.by_id_plain(conversation_id)
         if not conversation:
             raise HTTPException(status_code=404, detail="conversation not found")
         ctx.can_access_shop(user, int(conversation["shop_id"]))
         ctx.ensure_current_conversation(conversation)
-        ctx.db.execute(
-            """
-            UPDATE conversations
-            SET human_attention_required=0,
-                human_attention_reason=NULL,
-                human_attention_at=NULL
-            WHERE id=%s
-            """,
-            (conversation_id,),
-        )
+        ctx.repos.conversations.clear_attention(conversation_id)
         ctx.publish_conversation(conversation_id)
-        return ctx.conversation_row(conversation_id)
+        return ctx.repos.conversations.row(conversation_id)
 
     return router

@@ -76,6 +76,8 @@ class ShopRuntimeManager:
             max_workers=config.runtime.reply_workers,
             thread_name_prefix="reply-worker",
         )
+        from openkefu.web.repositories import Repositories
+        self.repos = Repositories(db)
         self.command_bus = RuntimeCommandBus(config.redis.url, config.runtime.command_secret)
         limiter_enabled = not config.security.rate_limit_disabled
         self._sms_limiter = FixedWindowRateLimiter(max_hits=1, window_seconds=60, enabled=limiter_enabled)
@@ -163,67 +165,26 @@ class ShopRuntimeManager:
 
     def acquire_shop_lease(self, shop_id: int, *, required: bool = False) -> bool:
         shop_id = int(shop_id)
-        ttl = int(self.config.runtime.lease_ttl_seconds)
-        with self.db.connect() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT * FROM shop_runtime_leases WHERE shop_id=%s FOR UPDATE", (shop_id,))
-                row = cursor.fetchone()
-                now = datetime.now()
-                can_take = (
-                    not row
-                    or str(row.get("worker_id") or "") == self.worker_id
-                    or (row.get("expires_at") and row["expires_at"] < now)
-                )
-                if not can_take:
-                    if required:
-                        raise RuntimeError(f"shop runtime is owned by worker {row.get('worker_id')}")
-                    return False
-                expires_at = now + timedelta(seconds=ttl)
-                if row:
-                    cursor.execute(
-                        """
-                        UPDATE shop_runtime_leases
-                        SET worker_id=%s, pid=%s, heartbeat_at=NOW(), expires_at=%s,
-                            status='online', version=version+1
-                        WHERE shop_id=%s
-                        """,
-                        (self.worker_id, os.getpid(), expires_at, shop_id),
-                    )
-                else:
-                    cursor.execute(
-                        """
-                        INSERT INTO shop_runtime_leases
-                        (shop_id, worker_id, pid, heartbeat_at, expires_at, status, version)
-                        VALUES (%s,%s,%s,NOW(),%s,'online',1)
-                        """,
-                        (shop_id, self.worker_id, os.getpid(), expires_at),
-                    )
-        with self._lock:
-            self._owned_shop_ids.add(shop_id)
-        return True
+        acquired = self.repos.shops.acquire_lease(
+            shop_id,
+            worker_id=self.worker_id,
+            pid=os.getpid(),
+            ttl_seconds=int(self.config.runtime.lease_ttl_seconds),
+            required=required,
+        )
+        if acquired:
+            with self._lock:
+                self._owned_shop_ids.add(shop_id)
+        return acquired
 
     def release_shop_lease(self, shop_id: int, *, status: str) -> None:
         shop_id = int(shop_id)
-        self.db.execute(
-            """
-            UPDATE shop_runtime_leases
-            SET status=%s, expires_at=NOW(), heartbeat_at=NOW()
-            WHERE shop_id=%s AND worker_id=%s
-            """,
-            (status, shop_id, self.worker_id),
-        )
+        self.repos.shops.release_lease(shop_id, worker_id=self.worker_id, status=status)
         with self._lock:
             self._owned_shop_ids.discard(shop_id)
 
     def owns_shop(self, shop_id: int) -> bool:
-        row = self.db.query_one(
-            "SELECT worker_id, expires_at FROM shop_runtime_leases WHERE shop_id=%s",
-            (int(shop_id),),
-        )
-        if not row:
-            return False
-        expires_at = row.get("expires_at")
-        return str(row.get("worker_id") or "") == self.worker_id and (not expires_at or expires_at >= datetime.now())
+        return self.repos.shops.owns_shop(int(shop_id), worker_id=self.worker_id)
 
     def start_background_services(self) -> None:
         if self._lease_thread and self._lease_thread.is_alive():
@@ -262,18 +223,11 @@ class ShopRuntimeManager:
         now = datetime.now()
         results: dict[str, int] = {}
         # 运行日志保留 30 天
-        results["runtime_logs"] = self.db.execute(
-            "DELETE FROM runtime_logs WHERE created_at < DATE_SUB(NOW(), INTERVAL 30 DAY)"
-        )
+        results["runtime_logs"] = self.repos.logs.delete_old(days=30)
         # 意图/动作/回复/转接等尝试记录保留 90 天
-        for table in ("intent_events", "action_requests", "reply_attempts", "transfer_attempts"):
-            results[table] = self.db.execute(
-                f"DELETE FROM {table} WHERE created_at < DATE_SUB(NOW(), INTERVAL 90 DAY)"
-            )
+        results.update(self.repos.conversations.cleanup_old_attempts(days=90))
         # 二维码登录尝试保留 7 天（含二维码图片文件清理）
-        stale_attempts = self.db.query(
-            "SELECT id, qrcode_path FROM qr_login_attempts WHERE created_at < DATE_SUB(NOW(), INTERVAL 7 DAY)"
-        )
+        stale_attempts = self.repos.shops.stale_qr_attempts(days=7)
         for attempt in stale_attempts:
             path = Path(str(attempt.get("qrcode_path") or ""))
             try:
@@ -282,9 +236,7 @@ class ShopRuntimeManager:
             except OSError:
                 pass
         if stale_attempts:
-            results["qr_login_attempts"] = self.db.execute(
-                "DELETE FROM qr_login_attempts WHERE created_at < DATE_SUB(NOW(), INTERVAL 7 DAY)"
-            )
+            results["qr_login_attempts"] = self.repos.shops.delete_stale_qr_attempts(days=7)
         self.runtime_logger.log(
             "INFO",
             __name__,
@@ -323,121 +275,39 @@ class ShopRuntimeManager:
         return max(self.STARTUP_RECONNECT_GRACE_SECONDS, ttl * 3)
 
     def _startup_reconnect_candidates(self) -> list[dict[str, Any]]:
-        grace_seconds = self._startup_reconnect_grace_seconds()
-        return self.db.query(
-            """
-            SELECT s.id
-            FROM shops s
-            JOIN shop_login_caches c ON c.shop_id=s.id
-            JOIN shop_runtime_leases l ON l.shop_id=s.id
-            WHERE s.status IN ('online','connecting')
-              AND l.status='online'
-              AND (
-                    l.worker_id=%s
-                    OR l.expires_at<DATE_SUB(NOW(), INTERVAL %s SECOND)
-                  )
-            ORDER BY s.id
-            """,
-            (self.worker_id, grace_seconds),
+        return self.repos.shops.startup_reconnect_candidates(
+            worker_id=self.worker_id,
+            grace_seconds=self._startup_reconnect_grace_seconds(),
         )
 
     def _cleanup_non_reconnectable_startup_state(self, reconnect_shop_ids: list[int]) -> list[int]:
-        grace_seconds = self._startup_reconnect_grace_seconds()
-        stale_rows = self.db.query(
-            """
-            SELECT s.id
-            FROM shops s
-            LEFT JOIN shop_login_caches c ON c.shop_id=s.id
-            LEFT JOIN shop_runtime_leases l ON l.shop_id=s.id
-            WHERE s.status IN ('online','connecting')
-              AND NOT (
-                    c.shop_id IS NOT NULL
-                    AND l.status='online'
-                    AND (
-                          l.worker_id=%s
-                          OR l.expires_at<DATE_SUB(NOW(), INTERVAL %s SECOND)
-                        )
-                  )
-              AND NOT (
-                    l.status='online'
-                    AND l.worker_id<>%s
-                    AND l.expires_at>=DATE_SUB(NOW(), INTERVAL %s SECOND)
-                  )
-            ORDER BY s.id
-            """,
-            (self.worker_id, grace_seconds, self.worker_id, grace_seconds),
+        stale_ids = self.repos.shops.non_reconnectable_online_shop_ids(
+            worker_id=self.worker_id,
+            grace_seconds=self._startup_reconnect_grace_seconds(),
         )
-        stale_shop_ids = [int(row["id"]) for row in stale_rows if int(row["id"]) not in set(reconnect_shop_ids)]
+        stale_shop_ids = [shop_id for shop_id in stale_ids if shop_id not in set(reconnect_shop_ids)]
         if not stale_shop_ids:
             return []
 
-        placeholders = ",".join(["%s"] * len(stale_shop_ids))
-        self.db.execute(
-            f"""
-            UPDATE shop_sessions
-            SET status='offline',
-                ended_at=COALESCE(ended_at, NOW()),
-                error=COALESCE(error, 'runtime worker restarted; reconnect not eligible')
-            WHERE status IN ('online','connecting')
-              AND shop_id IN ({placeholders})
-            """,
-            stale_shop_ids,
+        self.repos.shops.bulk_mark_sessions_offline(
+            stale_shop_ids, error='runtime worker restarted; reconnect not eligible',
         )
-        self.db.execute(
-            f"""
-            UPDATE shops
-            SET status='offline',
-                last_error=NULL
-            WHERE status IN ('online','connecting')
-              AND id IN ({placeholders})
-            """,
-            stale_shop_ids,
-        )
-        self.db.execute(
-            f"""
-            UPDATE shop_runtime_leases
-            SET status='offline',
-                expires_at=NOW(),
-                heartbeat_at=NOW()
-            WHERE shop_id IN ({placeholders})
-              AND (worker_id=%s OR expires_at<NOW())
-            """,
-            stale_shop_ids + [self.worker_id],
-        )
+        self.repos.shops.bulk_mark_shops_offline(stale_shop_ids)
+        self.repos.shops.bulk_release_stale_leases(stale_shop_ids, worker_id=self.worker_id)
         for shop_id in stale_shop_ids:
-            shop = self.db.query_one(
-                """
-                SELECT s.*, EXISTS(SELECT 1 FROM shop_login_caches c WHERE c.shop_id=s.id) AS has_login_cache
-                FROM shops s
-                WHERE s.id=%s
-                """,
-                (shop_id,),
-            )
+            shop = self.repos.shops.row_with_cache(shop_id)
             if shop:
                 self.hub.publish({"type": "shop_status", "data": shop})
         return stale_shop_ids
 
     def _claim_startup_reconnect_lease(self, shop_id: int) -> bool:
-        ttl = int(self.config.runtime.lease_ttl_seconds)
-        expires_at = datetime.now() + timedelta(seconds=ttl)
-        grace_seconds = self._startup_reconnect_grace_seconds()
-        updated = self.db.execute(
-            """
-            UPDATE shop_runtime_leases
-            SET worker_id=%s,
-                pid=%s,
-                heartbeat_at=NOW(),
-                expires_at=%s,
-                status='online',
-                version=version+1
-            WHERE shop_id=%s
-              AND status='online'
-              AND (
-                    worker_id=%s
-                    OR expires_at<DATE_SUB(NOW(), INTERVAL %s SECOND)
-                  )
-            """,
-            (self.worker_id, os.getpid(), expires_at, shop_id, self.worker_id, grace_seconds),
+        expires_at = datetime.now() + timedelta(seconds=int(self.config.runtime.lease_ttl_seconds))
+        updated = self.repos.shops.claim_startup_reconnect_lease(
+            int(shop_id),
+            worker_id=self.worker_id,
+            pid=os.getpid(),
+            expires_at=expires_at,
+            grace_seconds=self._startup_reconnect_grace_seconds(),
         )
         if not updated:
             return False
@@ -465,7 +335,6 @@ class ShopRuntimeManager:
 
         runner = self.runner(shop_id)
         try:
-            runner._require_creator_llm_quota("大模型调用额度不足，无法自动恢复上线店铺")
             runner._set_shop_status("connecting")
             self.hub.publish({"type": "shop_status", "data": runner._shop_row()})
             runner._connect_customer_service_from_cache()
@@ -494,10 +363,7 @@ class ShopRuntimeManager:
             except Exception:
                 pass
             if session_id:
-                self.db.execute(
-                    "UPDATE shop_sessions SET status='offline', ended_at=COALESCE(ended_at, NOW()), error=%s WHERE id=%s",
-                    (message, session_id),
-                )
+                self.repos.shops.end_session_with_error(session_id, message)
             self._mark_startup_reconnect_offline(shop_id, message)
             self.runtime_logger.log(
                 "WARNING" if verification_required else "ERROR",
@@ -511,56 +377,16 @@ class ShopRuntimeManager:
             )
 
     def _mark_startup_reconnect_offline(self, shop_id: int, message: str) -> None:
-        self.db.execute(
-            "UPDATE shops SET status='offline', last_error=%s WHERE id=%s",
-            (message, shop_id),
-        )
-        self.db.execute(
-            """
-            UPDATE shop_sessions
-            SET status='offline',
-                ended_at=COALESCE(ended_at, NOW()),
-                error=COALESCE(error, %s)
-            WHERE shop_id=%s
-              AND status IN ('online','connecting')
-            """,
-            (message, shop_id),
-        )
+        self.repos.shops.mark_shop_offline_with_error(shop_id, message)
+        self.repos.shops.end_shop_sessions_with_error(shop_id, message)
         self.release_shop_lease(shop_id, status="offline")
-        self.db.execute(
-            """
-            UPDATE shop_runtime_leases
-            SET status='offline',
-                expires_at=NOW(),
-                heartbeat_at=NOW()
-            WHERE shop_id=%s
-              AND (worker_id=%s OR expires_at<NOW())
-            """,
-            (shop_id, self.worker_id),
-        )
-        shop = self.db.query_one(
-            """
-            SELECT s.*, EXISTS(SELECT 1 FROM shop_login_caches c WHERE c.shop_id=s.id) AS has_login_cache
-            FROM shops s
-            WHERE s.id=%s
-            """,
-            (shop_id,),
-        )
+        self.repos.shops.force_offline_lease(shop_id, worker_id=self.worker_id)
+        shop = self.repos.shops.row_with_cache(shop_id)
         if shop:
             self.hub.publish({"type": "shop_status", "data": shop})
 
     def _has_active_runtime_lease(self, shop_id: int) -> bool:
-        row = self.db.query_one(
-            """
-            SELECT shop_id
-            FROM shop_runtime_leases
-            WHERE shop_id=%s
-              AND status='online'
-              AND expires_at>=NOW()
-            """,
-            (shop_id,),
-        )
-        return bool(row)
+        return self.repos.shops.has_active_lease(shop_id)
 
     @staticmethod
     def _is_verification_required_error(exc: Exception) -> bool:
@@ -615,13 +441,8 @@ class ShopRuntimeManager:
             expires_at = datetime.now() + timedelta(seconds=int(self.config.runtime.lease_ttl_seconds))
             for shop_id in shop_ids:
                 try:
-                    self.db.execute(
-                        """
-                        UPDATE shop_runtime_leases
-                        SET heartbeat_at=NOW(), expires_at=%s, pid=%s
-                        WHERE shop_id=%s AND worker_id=%s
-                        """,
-                        (expires_at, os.getpid(), shop_id, self.worker_id),
+                    self.repos.shops.heartbeat_lease(
+                        shop_id, worker_id=self.worker_id, pid=os.getpid(), expires_at=expires_at,
                     )
                 except Exception as exc:
                     # DB 瞬时故障不能让心跳线程死亡（否则租约过期后其他 worker
@@ -644,21 +465,7 @@ class ShopRuntimeManager:
         grace_seconds = self._startup_reconnect_grace_seconds()
         while not self._stop_event.wait(60):
             try:
-                stale_rows = self.db.query(
-                    """
-                    SELECT s.id
-                    FROM shops s
-                    LEFT JOIN shop_runtime_leases l ON l.shop_id=s.id
-                    WHERE s.status IN ('online','connecting')
-                      AND (
-                            l.shop_id IS NULL
-                            OR l.status<>'online'
-                            OR l.expires_at<DATE_SUB(NOW(), INTERVAL %s SECOND)
-                          )
-                    ORDER BY s.id
-                    """,
-                    (grace_seconds,),
-                )
+                stale_shop_ids = self.repos.shops.stale_online_shop_ids(grace_seconds=grace_seconds)
             except Exception as exc:
                 self.runtime_logger.log(
                     "ERROR",
@@ -668,37 +475,19 @@ class ShopRuntimeManager:
                     error=exc,
                 )
                 continue
-            for row in stale_rows:
-                shop_id = int(row["id"])
+            for shop_id in stale_shop_ids:
                 with self._lock:
                     runner = self._runners.get(shop_id)
                 if runner is not None and isinstance(runner.listener, dict) and runner.listener.get("client"):
                     # 本进程正在运行该店铺的 WS，跳过
                     continue
                 try:
-                    self.db.execute(
-                        "UPDATE shops SET status='offline', last_error=%s WHERE id=%s",
-                        ("检测到店铺实际不在线，已自动下线；如登录态仍有效可直接点击上线", shop_id),
+                    self.repos.shops.mark_shop_offline_with_error(
+                        shop_id, "检测到店铺实际不在线，已自动下线；如登录态仍有效可直接点击上线",
                     )
-                    self.db.execute(
-                        "UPDATE shop_sessions SET status='offline', ended_at=COALESCE(ended_at, NOW()), error=COALESCE(error, 'stale online cleanup') WHERE shop_id=%s AND status IN ('online','connecting')",
-                        (shop_id,),
-                    )
-                    self.db.execute(
-                        """
-                        UPDATE shop_runtime_leases
-                        SET status='offline', expires_at=NOW(), heartbeat_at=NOW()
-                        WHERE shop_id=%s AND expires_at<NOW()
-                        """,
-                        (shop_id,),
-                    )
-                    shop = self.db.query_one(
-                        """
-                        SELECT s.*, EXISTS(SELECT 1 FROM shop_login_caches c WHERE c.shop_id=s.id) AS has_login_cache
-                        FROM shops s WHERE s.id=%s
-                        """,
-                        (shop_id,),
-                    )
+                    self.repos.shops.end_shop_sessions_with_error(shop_id, 'stale online cleanup')
+                    self.repos.shops.expire_offline_lease(shop_id)
+                    shop = self.repos.shops.row_with_cache(shop_id)
                     if shop:
                         self.hub.publish({"type": "shop_status", "data": shop})
                     self.runtime_logger.log(
@@ -747,18 +536,10 @@ class ShopRuntimeManager:
                 self._stop_event.wait(2)
 
     def runtime_workers(self) -> list[dict[str, Any]]:
-        return self.db.query(
-            """
-            SELECT worker_id, pid, status, COUNT(*) AS shop_count,
-                   MAX(heartbeat_at) AS heartbeat_at, MAX(expires_at) AS expires_at
-            FROM shop_runtime_leases
-            GROUP BY worker_id, pid, status
-            ORDER BY heartbeat_at DESC
-            """
-        )
+        return self.repos.shops.runtime_workers()
 
     def shop_owner(self, shop_id: int) -> dict[str, Any] | None:
-        return self.db.query_one("SELECT * FROM shop_runtime_leases WHERE shop_id=%s", (int(shop_id),))
+        return self.repos.shops.shop_owner(int(shop_id))
 
     def handle_runtime_command(self, command: dict[str, Any]) -> bool:
         action = str(command.get("action") or "")

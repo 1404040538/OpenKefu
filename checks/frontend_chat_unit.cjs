@@ -83,7 +83,6 @@ function harness(relativePath, exportName, initialProps = {}) {
       if (messages) return response([{ id: Number(messages[1]), conversation_id: Number(messages[1]) }]);
       const context = url.match(/^\/api\/conversations\/(\d+)\/context$/);
       if (context) return response({ conversation_id: Number(context[1]) });
-      if (url === "/api/me/quota") return response({});
       return response([]);
     },
   };
@@ -178,7 +177,6 @@ test("an initial verification challenge shows the code input while login is pend
 test("a shop in error state can retry online when it has login cache", async () => {
   const shopPage = harness("components/ShopPage.tsx", "ShopPage", {
     shops: [{ id: 1, name: "shop", status: "error", has_login_cache: true }],
-    quota: null,
     selectedShopId: 1,
     onSelect: () => {},
     onCreate: async () => {},

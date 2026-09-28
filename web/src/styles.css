@@ -292,7 +292,6 @@ body {
   min-width: 0;
 }
 
-.quota-bar,
 .chat-sidebar,
 .chat-main,
 .chat-panel,
@@ -317,16 +316,7 @@ body {
   backdrop-filter: none;
 }
 
-.quota-bar {
-  padding: 10px 12px;
-  background: #fff;
-}
 
-.quota-item {
-  border-radius: 8px;
-  background: var(--bg-muted);
-  border: 1px solid var(--border);
-}
 
 .shop-grid {
   grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
@@ -636,13 +626,7 @@ body {
   color: var(--text);
 }
 
-.quota-progress {
-  background: #e5e7eb;
-}
 
-.quota-progress span {
-  background: var(--accent);
-}
 
 .modal-backdrop {
   background: rgba(15, 23, 42, 0.36);
@@ -943,13 +927,6 @@ select.input { cursor: pointer; }
 /* ---------- Shop Page ---------- */
 .shop-page { display: flex; flex-direction: column; }
 
-.quota-bar {
-  display: flex; flex-wrap: wrap; gap: 16px;
-  padding: 12px 16px; margin-bottom: 20px; flex-shrink: 0;
-  background: var(--bg-sidebar); border-radius: var(--radius);
-  font-size: 13px; color: var(--text-secondary);
-}
-.quota-item { display: inline-flex; align-items: center; gap: 4px; }
 
 .shop-grid {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
@@ -1428,17 +1405,7 @@ select.input { cursor: pointer; }
   display: flex; align-items: center; gap: 8px;
   font-size: 14px; font-weight: 600; color: var(--text-secondary); margin-bottom: 16px;
 }
-.profile-quota-card { border-color: rgba(0, 113, 227, 0.18); }
 .quota-number { font-size: 40px; line-height: 1; font-weight: 700; letter-spacing: 0; }
-.quota-caption { font-size: 13px; color: var(--text-secondary); margin-top: 6px; }
-.quota-progress {
-  height: 8px; margin: 22px 0 14px; border-radius: 999px;
-  background: var(--bg-hover); overflow: hidden;
-}
-.quota-progress span {
-  display: block; height: 100%; border-radius: inherit;
-  background: var(--accent); transition: width 0.2s ease;
-}
 .profile-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .profile-stats div {
   padding: 12px; border: 1px solid var(--border);
@@ -2050,7 +2017,6 @@ select {
   color: var(--text-secondary);
 }
 
-.quota-bar,
 .chat-sidebar,
 .chat-main,
 .chat-panel,
@@ -2075,19 +2041,7 @@ select {
   backdrop-filter: blur(14px) saturate(1.08);
 }
 
-.quota-bar {
-  margin-bottom: 18px;
-  padding: 12px 14px;
-  background: rgba(255, 255, 255, 0.62);
-  color: var(--text-secondary);
-}
 
-.quota-item {
-  padding: 4px 8px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.62);
-}
 
 .shop-grid {
   grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
@@ -2597,7 +2551,6 @@ select {
     font-size: 12px;
   }
 
-  .quota-bar,
   .return-record-actions,
   .shop-card-actions,
   .qa-editor-actions,
@@ -2710,7 +2663,6 @@ body,
 .sidebar,
 .auth-card,
 .modal,
-.quota-bar,
 .chat-sidebar,
 .chat-main,
 .chat-panel,
@@ -2738,12 +2690,6 @@ body,
 .sidebar-user-avatar,
 .btn-primary,
 .log-level-filter.active,
-.quota-progress span {
-  background: var(--accent) !important;
-  border-color: var(--accent) !important;
-  color: #fff !important;
-  background-image: none !important;
-}
 
 .btn-primary:hover {
   background: var(--accent-hover) !important;
@@ -3213,7 +3159,6 @@ body {
 .ops-hero-card,
 .ops-stat-card,
 .chat-command-strip,
-.quota-bar,
 .shop-card,
 .chat-sidebar,
 .chat-main,
@@ -5615,7 +5560,6 @@ select.input:focus {
 .ops-stat-card,
 .chat-command-strip,
 .chat-command-strip > div,
-.quota-bar,
 .shop-card,
 .chat-sidebar,
 .chat-main,
@@ -5655,7 +5599,6 @@ select.input:focus {
 .ops-hero-card,
 .ops-stat-card,
 .chat-command-strip,
-.quota-bar,
 .shop-card,
 .chat-sidebar,
 .chat-main,

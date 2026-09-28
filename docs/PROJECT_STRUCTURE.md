@@ -35,8 +35,9 @@
 | 模块 | 文件 | 功能 |
 |---|---|---|
 | 装配 | `app.py` | FastAPI 应用工厂：中间件、CORS、WS 端点、静态资源、lifespan |
-| 共享上下文 | `context.py` | AppContext：共享状态（db/hub/runtime/服务）+ 跨域辅助（认证依赖、配额、权限、会话查询、退货记录） |
+| 共享上下文 | `context.py` | AppContext：共享状态（db/hub/runtime/服务）+ 跨域辅助（认证依赖、权限、会话查询、退货记录） |
 | 路由 | `routers/` | 按域拆分的 APIRouter：auth / users / shops / chat / return_records / knowledge / logs / status（每个模块暴露 `build_router(ctx)`） |
+| 数据访问 | `repositories/` | 按域收敛全部 SQL：UsersRepository（users/app_settings/shop_assignments）、ShopsRepository（shops/sessions/login_caches/leases/qr/notes）、ConversationsRepository（conversations/messages/尝试记录）、ReturnRecordsRepository、RuntimeLogsRepository |
 | 无状态工具 | `deps.py` | client_ip / is_loopback_ip / validate_user_password |
 | 运行时 | `runtime/shop_runner.py` | ShopRunner：单店铺客服连接生命周期、自动回复调度 |
 | 运行时 | `runtime/manager.py` | ShopRuntimeManager：多店铺管理、租约/心跳、后台服务 |
@@ -48,14 +49,13 @@
 | 限流 | `ratelimit.py` | 内存固定窗口限流 |
 | 配置 | `config.py` | AppConfig 加载/校验（唯一入口 config.local.json，环境变量前缀 `OPENKEFU_`） |
 | 日志 | `logging_config.py` | 日志格式/滚动配置 |
-| 状态监控 | `server_status.py` | 服务状态采集 |
 
 ## 四、前端 `web/`（`[入库]`）
 
 | 目录/文件 | 功能 |
 |---|---|
 | `src/App.tsx` | 应用入口与路由/布局 |
-| `src/components/` | 页面组件：Auth / Chat / Knowledge / Logs / Shop / Users / ReturnRecords / ServerStatus / Profile / QrLogin / PasswordLogin / TransferSettings / StatusBadge / Toast / NavButton |
+| `src/components/` | 页面组件：Auth / Chat / Knowledge / Logs / Shop / Users / ReturnRecords / Profile / QrLogin / PasswordLogin / TransferSettings / StatusBadge / Toast / NavButton |
 | `src/types/types.ts` | TypeScript 类型定义 |
 | `src/utils/` | 常量、辅助函数、pending 操作 hook |
 | `package.json` / `vite.config.ts` 等 | 构建配置（lock 文件入库，Linux 用 `npm ci`） |
@@ -78,7 +78,6 @@
 | `realtime_unit.py` | 实时推送模块（含 Redis 重连） |
 | `return_records_unit.py` | 退货记录解析 |
 | `security_unit.py` | 安全/配置校验 |
-| `server_status_unit.py` | 状态采集 |
 | `db_pool_unit.py` | 连接池 |
 | `chat_transport_unit.py` | 聊天传输 |
 | `reply_cache_unit.py` | 回复缓存 |

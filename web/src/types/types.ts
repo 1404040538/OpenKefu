@@ -5,10 +5,6 @@ export type User = {
   role: "admin" | "service";
   is_active: boolean;
   shop_ids?: number[];
-  max_shops?: number | null;
-  max_knowledge_bases?: number | null;
-  max_llm_replies?: number;
-  llm_reply_count?: number;
 };
 
 export type Shop = {
@@ -25,14 +21,6 @@ export type Shop = {
   greeting_message?: string;
   greeting_use_llm?: number | boolean;
   force_ai_reply?: number | boolean;
-};
-
-export type Quota = {
-  max_llm_replies: number;
-  llm_reply_count: number;
-  remaining_llm_replies: number;
-  max_shops: number | null;
-  max_knowledge_bases: number | null;
 };
 
 export type ShopNote = {
@@ -160,83 +148,6 @@ export type LogResponse = {
   };
 };
 
-export type ServerStatusProcess = {
-  pid: number;
-  name: string;
-  username?: string;
-  cpu_percent: number;
-  memory_percent: number;
-};
-
-export type ServerStatusPartition = {
-  device: string;
-  mountpoint: string;
-  fstype?: string;
-  total: number;
-  used: number;
-  percent: number;
-};
-
-export type ServerStatusSample = {
-  node_id: string;
-  hostname: string;
-  pid: number;
-  collected_at: string;
-  cpu_percent: number;
-  cpu_count: number;
-  load1: number;
-  load5: number;
-  load15: number;
-  memory_total: number;
-  memory_used: number;
-  memory_percent: number;
-  swap_total: number;
-  swap_used: number;
-  swap_percent: number;
-  disk_total: number;
-  disk_used: number;
-  disk_percent: number;
-  disk_read_bps: number;
-  disk_write_bps: number;
-  net_recv_bps: number;
-  net_sent_bps: number;
-  connection_count: number;
-  uptime_seconds: number;
-  partitions: ServerStatusPartition[];
-  top_processes: ServerStatusProcess[];
-};
-
-export type ServerStatusLatest = {
-  status: string;
-  node_id?: string;
-  hostname?: string;
-  pid?: number;
-  heartbeat_at?: string;
-  lease_expires_at?: string;
-  stale: boolean;
-  last_error?: string;
-  sample: ServerStatusSample | null;
-};
-
-export type ServerStatusHistoryPoint = {
-  collected_at: string;
-  cpu_percent: number;
-  max_cpu_percent: number;
-  memory_percent: number;
-  max_memory_percent: number;
-  disk_percent: number;
-  max_disk_percent: number;
-  load1: number;
-  net_recv_bps: number;
-  net_sent_bps: number;
-  connection_count: number;
-};
-
-export type ServerStatusHistory = {
-  range: "1h" | "6h" | "24h" | "7d" | "30d";
-  bucket_seconds: number;
-  items: ServerStatusHistoryPoint[];
-};
 
 export type ReturnRecord = {
   id: number;
@@ -322,6 +233,6 @@ export type NoteSet = {
   updated_at?: string;
 };
 
-export type ViewName = "shops" | "chat" | "knowledge" | "returnRecords" | "users" | "logs" | "profile" | "serverStatus";
+export type ViewName = "shops" | "chat" | "knowledge" | "returnRecords" | "users" | "logs" | "profile" ;
 export type AuthMode = "checking" | "setup" | "login" | "register";
 export type ShopFilter = "all" | number;

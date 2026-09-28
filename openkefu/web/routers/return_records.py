@@ -61,21 +61,11 @@ def build_router(ctx) -> APIRouter:
             date_from=date_from,
             date_to=date_to,
         )
-        total = ctx.db.query_one(f"SELECT COUNT(*) AS cnt FROM return_records rr{where_sql}", values)
-        rows = ctx.db.query(
-            f"""
-            SELECT rr.*, s.name AS shop_name
-            FROM return_records rr
-            JOIN shops s ON s.id=rr.shop_id
-            {where_sql}
-            ORDER BY rr.created_at DESC, rr.id DESC
-            LIMIT %s OFFSET %s
-            """,
-            [*values, limit, offset],
-        )
+        total = ctx.repos.return_records.count(where_sql, values)
+        rows = ctx.repos.return_records.search(where_sql, values, limit=limit, offset=offset)
         return {
             "items": [ctx.serialize_return_record(row) for row in rows],
-            "total": int((total or {}).get("cnt") or 0),
+            "total": total,
             "limit": limit,
             "offset": offset,
         }
@@ -117,7 +107,7 @@ def build_router(ctx) -> APIRouter:
     @router.delete("/api/return-records/{record_id}")
     def delete_return_record(record_id: int, user: dict[str, Any] = Depends(ctx.current_user)):
         row = ctx.return_record_by_id(record_id, user)
-        ctx.db.execute("DELETE FROM return_records WHERE id=%s", (record_id,))
+        ctx.repos.return_records.delete(record_id)
         ctx.hub.publish({"type": "return_record_deleted", "data": {"id": record_id, "shop_id": row.get("shop_id")}})
         return {"ok": True}
 
@@ -138,17 +128,7 @@ def build_router(ctx) -> APIRouter:
             date_from=date_from,
             date_to=date_to,
         )
-        rows = ctx.db.query(
-            f"""
-            SELECT rr.*, s.name AS shop_name
-            FROM return_records rr
-            JOIN shops s ON s.id=rr.shop_id
-            {where_sql}
-            ORDER BY rr.created_at DESC, rr.id DESC
-            LIMIT 5000
-            """,
-            values,
-        )
+        rows = ctx.repos.return_records.search(where_sql, values)
         workbook = Workbook()
         sheet = workbook.active
         sheet.title = "退换记录"

@@ -11,15 +11,13 @@ export function UsersPage({ users, shops, settings, onCreate, onUpdate, onSettin
   onUpdate: (id: number, body: any) => Promise<void>;
   onSettingsUpdate: (body: any) => Promise<void>;
 }) {
-  const [form, setForm] = useState({ username: "", password: "", display_name: "", role: "service", shop_ids: [] as number[], max_llm_replies: "0", max_shops: "10", max_knowledge_bases: "5" });
+  const [form, setForm] = useState({ username: "", password: "", display_name: "", role: "service", shop_ids: [] as number[] });
   const [editTarget, setEditTarget] = useState<User | null>(null);
-  const [editForm, setEditForm] = useState({ display_name: "", is_active: true, password: "", max_llm_replies: "" as string, llm_reply_count: "" as string, max_shops: "" as string, max_knowledge_bases: "" as string });
+  const [editForm, setEditForm] = useState({ display_name: "", is_active: true, password: "" });
   const { isPending, runAction } = usePendingActions();
   const createPending = isPending("user-create");
   const editPending = editTarget ? isPending(`user-update-${editTarget.id}`) : false;
   const settingsPending = isPending("registration-settings");
-  const createIsAdmin = form.role === "admin";
-  const editIsAdmin = editTarget?.role === "admin";
 
   return (
     <div className="page users-page">
@@ -28,7 +26,7 @@ export function UsersPage({ users, shops, settings, onCreate, onUpdate, onSettin
             <Users size={22} />
             <div>
             <h2 className="page-title">账号管理</h2>
-            <p className="page-subtitle">{users.length} 个账号，分配角色、店铺、注册开关和资源额度</p>
+            <p className="page-subtitle">{users.length} 个账号，分配角色、店铺与注册开关</p>
             </div>
         </div>
         <button
@@ -45,7 +43,7 @@ export function UsersPage({ users, shops, settings, onCreate, onUpdate, onSettin
         <section className="users-table-wrap">
           <table className="table">
             <thead>
-              <tr><th>用户名</th><th>名称</th><th>角色</th><th>状态</th><th>店铺</th><th>知识库上限</th><th>店铺上限</th><th>LLM 总额度</th><th>LLM 已用</th><th>LLM 剩余</th><th>操作</th></tr>
+              <tr><th>用户名</th><th>名称</th><th>角色</th><th>状态</th><th>店铺</th><th>操作</th></tr>
             </thead>
             <tbody>
               {users.map((item) => (
@@ -55,21 +53,10 @@ export function UsersPage({ users, shops, settings, onCreate, onUpdate, onSettin
                   <td><span className={`role-tag ${item.role}`}>{item.role === "admin" ? "管理员" : "客服"}</span></td>
                   <td><span className={`state-tag ${item.is_active ? "active" : "inactive"}`}>{item.is_active ? "启用" : "停用"}</span></td>
                   <td>{item.shop_ids?.length || 0}</td>
-                  <td>{item.role === "admin" ? "不限制" : item.max_knowledge_bases ?? 5}</td>
-                  <td>{item.role === "admin" ? "不限制" : item.max_shops ?? 10}</td>
-                  <td>{item.max_llm_replies ?? 0}</td>
-                  <td>{item.llm_reply_count || 0}</td>
-                  <td>{Math.max(0, (item.max_llm_replies || 0) - (item.llm_reply_count || 0))}</td>
                   <td>
                     <button className="btn btn-sm" onClick={() => {
                       setEditTarget(item);
-                      setEditForm({
-                        display_name: item.display_name, is_active: item.is_active, password: "",
-                        max_llm_replies: String(item.max_llm_replies || 0),
-                        llm_reply_count: String(item.llm_reply_count || 0),
-                        max_shops: String(item.max_shops ?? 10),
-                        max_knowledge_bases: String(item.max_knowledge_bases ?? 5),
-                      });
+                      setEditForm({ display_name: item.display_name, is_active: item.is_active, password: "" });
                     }}>编辑</button>
                   </td>
                 </tr>
@@ -86,11 +73,8 @@ export function UsersPage({ users, shops, settings, onCreate, onUpdate, onSettin
               await onCreate({
                 username: form.username, password: form.password, display_name: form.display_name, role: form.role,
                 shop_ids: form.shop_ids,
-                max_shops: createIsAdmin ? null : parseInt(form.max_shops) || 0,
-                max_knowledge_bases: createIsAdmin ? null : parseInt(form.max_knowledge_bases) || 0,
-                max_llm_replies: parseInt(form.max_llm_replies) || 0,
               });
-              setForm({ username: "", password: "", display_name: "", role: "service", shop_ids: [], max_llm_replies: "0", max_shops: "10", max_knowledge_bases: "5" });
+              setForm({ username: "", password: "", display_name: "", role: "service", shop_ids: [] });
             }).catch(() => undefined);
           }}>
             <div className="form-group"><input className="input" disabled={createPending} placeholder="用户名" value={form.username} required onChange={(e) => setForm({ ...form, username: e.target.value })} /></div>
@@ -102,9 +86,6 @@ export function UsersPage({ users, shops, settings, onCreate, onUpdate, onSettin
                 <option value="admin">管理员</option>
               </select>
             </div>
-            <div className="form-group"><input className="input" disabled={createPending || createIsAdmin} placeholder={createIsAdmin ? "管理员不限制知识库" : "知识库上限"} type="number" min="0" value={createIsAdmin ? "" : form.max_knowledge_bases} onChange={(e) => setForm({ ...form, max_knowledge_bases: e.target.value })} /></div>
-            <div className="form-group"><input className="input" disabled={createPending || createIsAdmin} placeholder={createIsAdmin ? "管理员不限制店铺" : "店铺上限"} type="number" min="0" value={createIsAdmin ? "" : form.max_shops} onChange={(e) => setForm({ ...form, max_shops: e.target.value })} /></div>
-            <div className="form-group"><input className="input" disabled={createPending} placeholder="LLM 总额度" type="number" min="0" value={form.max_llm_replies} onChange={(e) => setForm({ ...form, max_llm_replies: e.target.value })} /></div>
             <div className="check-list">
               {shops.map((shop) => (
                 <label key={shop.id} className="kb-shop-check">
@@ -132,19 +113,9 @@ export function UsersPage({ users, shops, settings, onCreate, onUpdate, onSettin
               <div className="form-group"><input className="input" disabled={editPending} placeholder="显示名" value={editForm.display_name} onChange={(e) => setEditForm({ ...editForm, display_name: e.target.value })} /></div>
               <label className="checkbox-label"><input type="checkbox" disabled={editPending} checked={editForm.is_active} onChange={(e) => setEditForm({ ...editForm, is_active: e.target.checked })} /><span>启用</span></label>
               <div className="form-group"><input className="input" disabled={editPending} placeholder="新密码，留空则不修改" type="password" value={editForm.password} onChange={(e) => setEditForm({ ...editForm, password: e.target.value })} /></div>
-              <div className="form-group"><input className="input" disabled={editPending || editIsAdmin} placeholder={editIsAdmin ? "管理员不限制知识库" : "知识库上限"} type="number" min="0" value={editIsAdmin ? "" : editForm.max_knowledge_bases} onChange={(e) => setEditForm({ ...editForm, max_knowledge_bases: e.target.value })} /></div>
-              <div className="form-group"><input className="input" disabled={editPending || editIsAdmin} placeholder={editIsAdmin ? "管理员不限制店铺" : "店铺上限"} type="number" min="0" value={editIsAdmin ? "" : editForm.max_shops} onChange={(e) => setEditForm({ ...editForm, max_shops: e.target.value })} /></div>
-              <div className="form-group"><input className="input" disabled={editPending} placeholder="LLM 总额度" type="number" min="0" value={editForm.max_llm_replies} onChange={(e) => setEditForm({ ...editForm, max_llm_replies: e.target.value })} /></div>
-              <div className="form-group"><input className="input" disabled={editPending} placeholder="LLM 已用次数" type="number" min="0" value={editForm.llm_reply_count} onChange={(e) => setEditForm({ ...editForm, llm_reply_count: e.target.value })} /></div>
               <button className="btn btn-primary btn-full" disabled={editPending} onClick={async () => {
                 await runAction(`user-update-${editTarget.id}`, async () => {
-                  const body: any = { display_name: editForm.display_name, is_active: editForm.is_active,
-                    max_llm_replies: parseInt(editForm.max_llm_replies) || 0,
-                    llm_reply_count: parseInt(editForm.llm_reply_count) || 0 };
-                  if (!editIsAdmin) {
-                    body.max_shops = parseInt(editForm.max_shops) || 0;
-                    body.max_knowledge_bases = parseInt(editForm.max_knowledge_bases) || 0;
-                  }
+                  const body: any = { display_name: editForm.display_name, is_active: editForm.is_active };
                   if (editForm.password) body.password = editForm.password;
                   await onUpdate(editTarget.id, body); setEditTarget(null);
                 }).catch(() => undefined);

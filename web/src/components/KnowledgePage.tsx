@@ -9,7 +9,6 @@ import { usePendingActions } from "../utils/usePendingActions";
 type ContentType = "kb" | "ns";
 type MixedItem = { type: "kb"; data: KnowledgeBase } | { type: "ns"; data: NoteSet };
 type EditableKnowledgeQaItem = KnowledgeQaItem & { _localId: string };
-const MAX_SERVICE_KNOWLEDGE_FILES = 3;
 const MAX_SERVICE_FILE_BYTES = 20 * 1024 * 1024;
 
 function itemKey(item: MixedItem) {
@@ -80,10 +79,7 @@ export function KnowledgePage({
   const selected = mixedList.find((item) => itemKey(item) === selectedKey) || mixedList[0] || null;
   const isKnowledgeBase = selected?.type === "kb";
   const status = detail?.status || selected?.data.status || "active";
-  const maxKnowledgeBases = user.role === "admin" ? null : user.max_knowledge_bases ?? 5;
-  const canCreateKnowledgeBase = maxKnowledgeBases == null || knowledgeBases.length < maxKnowledgeBases;
   const selectedFileCount = isKnowledgeBase ? ((detail as KnowledgeBase | null)?.files || []).length : 0;
-  const canUploadKnowledgeFile = user.role === "admin" || selectedFileCount < MAX_SERVICE_KNOWLEDGE_FILES;
 
   useEffect(() => {
     if (selected && selectedKey !== itemKey(selected)) setSelectedKey(itemKey(selected));
@@ -384,8 +380,8 @@ export function KnowledgePage({
                   {canManage && (
                     <label className="upload-drop">
                       <UploadCloud size={20} />
-                      <span>{busy ? "处理中" : canUploadKnowledgeFile ? "上传 txt、md、csv、xlsx、docx、pdf，单文件不超过 20MB" : "文件数量已达上限"}</span>
-                      <input type="file" accept=".txt,.md,.csv,.xlsx,.docx,.pdf" disabled={busy || !canUploadKnowledgeFile} onChange={(event) => {
+                      <span>{busy ? "处理中" : "上传 txt、md、csv、xlsx、docx、pdf，单文件不超过 20MB"}</span>
+                      <input type="file" accept=".txt,.md,.csv,.xlsx,.docx,.pdf" disabled={busy} onChange={(event) => {
                         const file = event.target.files?.[0];
                         event.currentTarget.value = "";
                         if (!file) return;
@@ -393,15 +389,10 @@ export function KnowledgePage({
                           alert("文件大小不能超过 20MB");
                           return;
                         }
-                        if (!canUploadKnowledgeFile) {
-                          alert("单个知识库最多上传 3 个文件");
-                          return;
-                        }
                         withBusy(() => onUpload(selected.data.id, file));
                       }} />
                     </label>
                   )}
-                  {canManage && !canUploadKnowledgeFile && <div className="empty-note">单个知识库最多上传 3 个文件</div>}
                   <div className="file-list">
                     {((detail as KnowledgeBase)?.files || []).map((file) => (
                       <div className={`file-row ${file.status}`} key={file.id}>
@@ -504,10 +495,7 @@ export function KnowledgePage({
                 ))}
                 {!shops.length && <div className="empty-note">暂无可绑定店铺</div>}
               </div>
-              {createType === "kb" && !canCreateKnowledgeBase && (
-                <div className="empty-note">知识库数量已达上限：{knowledgeBases.length}/{maxKnowledgeBases}</div>
-              )}
-              <button className="btn btn-primary btn-full" disabled={!name.trim() || busy || (createType === "kb" && !canCreateKnowledgeBase)}>
+              <button className="btn btn-primary btn-full" disabled={!name.trim() || busy}>
                 {busy ? <Loader2 className="spin" size={16} /> : null}
                 {busy ? "创建中" : "创建"}
               </button>

@@ -55,13 +55,5 @@
   },
   "storage": {
     "knowledge_dir": "data/knowledge_files"
-  },
-  "server_status": {
-    "enabled": true,
-    "collect_interval_seconds": 5,
-    "persist_interval_seconds": 30,
-    "raw_retention_days": 7,
-    "rollup_retention_days": 30,
-    "top_process_limit": 8
   }
 }

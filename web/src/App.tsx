@@ -1,6 +1,6 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, BookOpen, Bot, CircleUserRound, Gauge, LogOut, MessageSquareText, PackageSearch, Radio, Server, Store, Users } from "lucide-react";
-import type { User, Shop, Conversation, Message, LogResponse, KnowledgeBase, NoteSet, Quota, ViewName, AuthMode, ShopFilter, CustomerContext, ReturnRecordResponse, ServerStatusHistory, ServerStatusLatest } from "./types/types";
+import { Activity, BookOpen, Bot, CircleUserRound, LogOut, MessageSquareText, PackageSearch, Radio, Store, Users } from "lucide-react";
+import type { User, Shop, Conversation, Message, LogResponse, KnowledgeBase, NoteSet, ViewName, AuthMode, ShopFilter, CustomerContext, ReturnRecordResponse } from "./types/types";
 import { NavButton } from "./components/NavButton";
 import { Toast } from "./components/Toast";
 import { BootPage, LoginPage, RegisterPage, SetupAdminPage } from "./components/AuthPages";
@@ -11,7 +11,6 @@ import { ReturnRecordsPage } from "./components/ReturnRecordsPage";
 import { UsersPage } from "./components/UsersPage";
 import { LogsPage } from "./components/LogsPage";
 import { ProfilePage } from "./components/ProfilePage";
-import { ServerStatusPage } from "./components/ServerStatusPage";
 import { TransferSettingsModal } from "./components/TransferSettingsModal";
 import { QrLoginModal } from "./components/QrLoginModal";
 import { PasswordLoginModal, type VerifyInfo } from "./components/PasswordLoginModal";
@@ -67,9 +66,6 @@ export function App() {
   const [adminSettings, setAdminSettings] = useState({ registration_enabled: true });
   const [logData, setLogData] = useState<LogResponse | null>(null);
   const [logFilters, setLogFilters] = useState<Record<string, string>>({});
-  const [serverStatusLatest, setServerStatusLatest] = useState<ServerStatusLatest | null>(null);
-  const [serverStatusHistory, setServerStatusHistory] = useState<ServerStatusHistory | null>(null);
-  const [serverStatusRange, setServerStatusRange] = useState<ServerStatusHistory["range"]>("1h");
   const [returnRecordData, setReturnRecordData] = useState<ReturnRecordResponse | null>(null);
   const [returnRecordFilters, setReturnRecordFilters] = useState<Record<string, string>>({});
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([]);
@@ -86,7 +82,6 @@ export function App() {
   const [pwdVerifyPrompt, setPwdVerifyPrompt] = useState<{ shopId: number; verifyInfo: VerifyInfo } | null>(null);
   const [transferSettingsShopId, setTransferSettingsShopId] = useState<number | null>(null);
   const [transferServices, setTransferServices] = useState<any[]>([]);
-  const [quota, setQuota] = useState<Quota | null>(null);
   const [toast, setToast] = useState("");
   const wsRef = useRef<WebSocket | null>(null);
   const selectedConversationIdRef = useRef<number | null>(null);
@@ -140,26 +135,17 @@ export function App() {
     return rows;
   }, [apiFetch, applyShopRows, token]);
 
-  const loadQuota = useCallback(async () => {
-    if (!token) return null;
-    const response = await apiFetch("/api/me/quota");
-    const data = await response.json();
-    setQuota(data);
-    return data;
-  }, [apiFetch, token]);
-
   const loadAll = useCallback(async () => {
     if (!token) return;
-    const [meRes, shopRes, kbRes, nsRes, quotaRes] = await Promise.all([
+    const [meRes, shopRes, kbRes, nsRes] = await Promise.all([
       apiFetch("/api/me"), apiFetch("/api/shops"),
-      apiFetch("/api/knowledge-bases"), apiFetch("/api/note-sets"), apiFetch("/api/me/quota"),
+      apiFetch("/api/knowledge-bases"), apiFetch("/api/note-sets"),
     ]);
     const me = await meRes.json();
     const shopRows = await shopRes.json();
     setUser(me); applyShopRows(shopRows);
     setKnowledgeBases(await kbRes.json());
     setNoteSets(await nsRes.json());
-    setQuota(await quotaRes.json());
     if (me.role === "admin") {
       const [userRes, logRes, settingsRes] = await Promise.all([apiFetch("/api/users"), apiFetch("/api/logs"), apiFetch("/api/admin/settings")]);
       setUsers(await userRes.json());
@@ -255,9 +241,6 @@ export function App() {
         if (payload.type === "runtime_log") {
           if (view === "logs") loadLogs(logFilters).catch(() => undefined);
         }
-        if (payload.type === "server_status") {
-          setServerStatusLatest(payload.data as ServerStatusLatest);
-        }
         if (payload.type === "return_record") {
           if (view === "returnRecords") loadReturnRecords(returnRecordFilters).catch(() => undefined);
           setToast("已新增退换记录");
@@ -268,7 +251,6 @@ export function App() {
         }
         if (payload.type === "reply_result" || payload.type === "transfer_result") setToast(payload.data.status === "success" ? "操作成功" : payload.data.error || "操作失败");
         if (payload.type === "action_request") setToast(payload.data?.action_type === "transfer_to_human" ? "已预留转人工处理" : "已记录后续动作");
-        if (payload.type === "llm_quota_exceeded") loadQuota().catch(() => undefined);
       };
       ws.onclose = () => {
         if (disposed) return;
@@ -466,19 +448,6 @@ export function App() {
     setLogData(await response.json());
   }
 
-  async function loadServerStatusLatest() {
-    const response = await apiFetch("/api/server-status/latest");
-    setServerStatusLatest(await response.json());
-  }
-
-  async function loadServerStatusHistory(range: ServerStatusHistory["range"] = serverStatusRange) {
-    const response = await apiFetch(`/api/server-status/history?range=${range}`);
-    setServerStatusHistory(await response.json());
-  }
-
-  async function loadServerStatus(range: ServerStatusHistory["range"] = serverStatusRange) {
-    await Promise.all([loadServerStatusLatest(), loadServerStatusHistory(range)]);
-  }
 
   async function loadReturnRecords(filters: Record<string, string> = returnRecordFilters) {
     const params = new URLSearchParams();
@@ -552,20 +521,6 @@ export function App() {
     setView("shops");
   }, [user, view]);
   useEffect(() => {
-    if (!token || view !== "serverStatus" || user?.role !== "admin") return;
-    loadServerStatus(serverStatusRange).catch((error) => setToast(error.message));
-    const latestTimer = window.setInterval(() => {
-      loadServerStatusLatest().catch(() => undefined);
-    }, 5000);
-    const historyTimer = window.setInterval(() => {
-      loadServerStatusHistory(serverStatusRange).catch(() => undefined);
-    }, 30000);
-    return () => {
-      window.clearInterval(latestTimer);
-      window.clearInterval(historyTimer);
-    };
-  }, [token, view, user?.role, serverStatusRange]);
-  useEffect(() => {
     if (!token || view !== "returnRecords") return;
     loadReturnRecords(returnRecordFilters).catch((error) => setToast(error.message));
     const timer = window.setInterval(() => {
@@ -608,12 +563,10 @@ export function App() {
     returnRecords: { title: "售后记录流", subtitle: "沉淀退换、退款、改址和物流拦截记录" },
     users: { title: "账号管理", subtitle: "管理账号、角色、注册开关和资源额度" },
     logs: { title: "运行观测", subtitle: "追踪任务批次、请求定位和异常堆栈" },
-    serverStatus: { title: "服务器状态", subtitle: "查看 Linux 主机资源、网络和进程趋势" },
     profile: { title: "个人工作区", subtitle: "查看个人账号、店铺范围和共享额度" },
   };
   const onlineShopCount = shops.filter((shop) => shop.status === "online").length;
   const attentionCount = conversations.filter((conversation) => conversation.human_attention_required).length;
-  const quotaRemaining = quota?.remaining_llm_replies ?? 0;
 
   return (
     <div className="app-shell">
@@ -630,9 +583,8 @@ export function App() {
           <NavButton active={view === "chat"} icon={<MessageSquareText size={18} />} label="客服聊天" onClick={() => setView("chat")} />
           <NavButton active={view === "knowledge"} icon={<BookOpen size={18} />} label="知识库" onClick={() => setView("knowledge")} />
           <NavButton active={view === "returnRecords"} icon={<PackageSearch size={18} />} label="退换记录" onClick={() => setView("returnRecords")} />
-          <NavButton active={view === "profile"} icon={<CircleUserRound size={18} />} label="个人中心" onClick={() => { setView("profile"); loadQuota().catch((error) => setToast(error.message)); }} />
+          <NavButton active={view === "profile"} icon={<CircleUserRound size={18} />} label="个人中心" onClick={() => setView("profile")} />
           {user.role === "admin" && <NavButton active={view === "users"} icon={<Users size={18} />} label="账号管理" onClick={() => setView("users")} />}
-          {user.role === "admin" && <NavButton active={view === "serverStatus"} icon={<Server size={18} />} label="服务器状态" onClick={() => setView("serverStatus")} />}
           {user.role === "admin" && <NavButton active={view === "logs"} icon={<Activity size={18} />} label="日志" onClick={() => setView("logs")} />}
         </nav>
         <div className="sidebar-footer">
@@ -659,11 +611,10 @@ export function App() {
           <div className="ops-topbar-metrics">
             <div className="ops-metric"><Store size={15} /><span>在线店铺</span><strong>{onlineShopCount}/{shops.length}</strong></div>
             <div className="ops-metric"><Bot size={15} /><span>待人工</span><strong>{attentionCount}</strong></div>
-            <div className="ops-metric"><Gauge size={15} /><span>LLM 剩余</span><strong>{quotaRemaining}</strong></div>
-          </div>
+            </div>
         </header>
         <div className="main-content">
-          {view === "shops" && <ShopPage shops={shops} quota={quota} selectedShopId={selectedShopId}
+          {view === "shops" && <ShopPage shops={shops} selectedShopId={selectedShopId}
             onSelect={setSelectedShopId}
             onCreate={async (body: any) => withToast(async () => { await apiFetch("/api/shops", { method: "POST", body: JSON.stringify(body) }); await loadAll(); }, "店铺已创建")}
             onLogin={async (shopId: number) => withToast(async () => { setQrModalShopId(shopId); const result = await (await apiFetch(`/api/shops/${shopId}/login`, { method: "POST" })).json(); if (result.qrcode_url) await fetchQrcode(shopId, result.qrcode_url); await loadAll(); }, "登录流程已启动")}
@@ -724,17 +675,7 @@ export function App() {
             onUpdate={async (id: number, body: any) => withToast(async () => { await apiFetch(`/api/users/${id}`, { method: "PATCH", body: JSON.stringify(body) }); const response = await apiFetch("/api/users"); setUsers(await response.json()); }, "账号已保存")}
             onSettingsUpdate={async (body: any) => withToast(async () => { const response = await apiFetch("/api/admin/settings", { method: "PATCH", body: JSON.stringify(body) }); const data = await response.json(); setAdminSettings(data); setRegistrationEnabled(Boolean(data.registration_enabled)); }, "注册设置已保存")}
           />}
-          {view === "profile" && <ProfilePage user={user} quota={quota} shops={shops} />}
-          {view === "serverStatus" && user.role === "admin" && <ServerStatusPage
-            latest={serverStatusLatest}
-            history={serverStatusHistory}
-            range={serverStatusRange}
-            onRangeChange={(nextRange) => {
-              setServerStatusRange(nextRange);
-              loadServerStatusHistory(nextRange).catch((error) => setToast(error.message));
-            }}
-            onRefresh={() => loadServerStatus(serverStatusRange)}
-          />}
+          {view === "profile" && <ProfilePage user={user} shops={shops} />}
           {view === "logs" && user.role === "admin" && <LogsPage data={logData}
             filters={logFilters}
             onFiltersChange={(next) => { setLogFilters(next); loadLogs(next).catch((error) => setToast(error.message)); }}

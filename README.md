@@ -33,8 +33,8 @@ Web 控制台（React） ── FastAPI 后端 ── 店铺运行时（ShopRunn
 - **人工接管**：一键转人工 / 转接指定客服，人工回复与 AI 回复自动协调。
 - **知识库**：文档上传、问答对维护、向量检索（MySQL 持久化）。
 - **退换货记录**：从聊天中提取退换/改地址诉求，结构化记录、检索与 Excel 导出。
-- **多用户与配额**：管理员/客服角色，店铺/知识库数量与 LLM 调用配额管理。
-- **可观测性**：运行日志入库与检索、服务器状态监控、实时 WS 推送。
+- **多用户管理**：管理员/客服角色，店铺分配与注册开关管理。
+- **可观测性**：运行日志入库与检索、实时 WS 推送。
 - **生产就绪**：api/worker 分离部署、Redis 命令总线、店铺租约高可用、systemd/nginx 部署模板。
 
 ## 快速开始（本机体验）
@@ -150,6 +150,7 @@ python run_web.py --prod --role both
 │   │   ├── app.py              # FastAPI 装配（中间件/WS/静态资源）
 │   │   ├── context.py          # 共享状态与跨域辅助
 │   │   ├── routers/            # API 路由（auth/users/shops/chat/...）
+│   │   ├── repositories/       # 数据访问层（按域收敛全部 SQL）
 │   │   ├── runtime/            # 店铺运行时（ShopRunner + Manager）
 │   │   ├── db.py / realtime.py / runtime_bus.py / security.py / ...
 │   └── config.py               # 包级路径常量（见 platforms/pdd/config.py）
@@ -167,7 +168,7 @@ python run_web.py --prod --role both
    - **登录**：获取并维护平台登录态（cookie/token），支持加密缓存
    - **消息通道**：平台 IM 协议的收发（参考 `pdd/chat/titan_ws_client.py`）
    - **业务接口**：发消息、会话列表、商品、订单、转接等（参考 `pdd/chat/customer_service.py`）
-2. 复用 `openkefu/web/` 通用层：多用户、配额、知识库、实时推送、租约高可用均与平台无关。
+2. 复用 `openkefu/web/` 通用层：多用户、知识库、实时推送、租约高可用均与平台无关。
 3. 在 ShopRunner 中接入新平台的启动/重连/下线流程。
 
 ## 开发

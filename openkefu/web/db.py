@@ -396,51 +396,6 @@ class Database:
 
         cursor.execute(
             "SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS "
-            "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='users' AND COLUMN_NAME='max_shops'",
-            (mysql.database,),
-        )
-        if cursor.fetchone()["cnt"] == 0:
-            cursor.execute("ALTER TABLE users ADD COLUMN max_shops INT NULL")
-            logger.info("migration: added max_shops column to users")
-
-        cursor.execute(
-            "SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS "
-            "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='users' AND COLUMN_NAME='max_llm_replies'",
-            (mysql.database,),
-        )
-        if cursor.fetchone()["cnt"] == 0:
-            cursor.execute(
-                "ALTER TABLE users ADD COLUMN max_llm_replies INT NOT NULL DEFAULT 0 "
-                "COMMENT 'finite LLM call quota; 0 means no quota'"
-            )
-            logger.info("migration: added max_llm_replies column to users")
-
-        cursor.execute(
-            "SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS "
-            "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='users' AND COLUMN_NAME='llm_reply_count'",
-            (mysql.database,),
-        )
-        if cursor.fetchone()["cnt"] == 0:
-            cursor.execute("ALTER TABLE users ADD COLUMN llm_reply_count INT NOT NULL DEFAULT 0")
-            logger.info("migration: added llm_reply_count column to users")
-
-        cursor.execute(
-            "SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS "
-            "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='users' AND COLUMN_NAME='max_knowledge_bases'",
-            (mysql.database,),
-        )
-        if cursor.fetchone()["cnt"] == 0:
-            cursor.execute("ALTER TABLE users ADD COLUMN max_knowledge_bases INT NULL AFTER max_shops")
-            logger.info("migration: added max_knowledge_bases column to users")
-
-        cursor.execute("UPDATE users SET max_shops=10 WHERE role<>'admin' AND max_shops IS NULL")
-        cursor.execute(
-            "UPDATE users SET max_knowledge_bases=5 WHERE role<>'admin' AND max_knowledge_bases IS NULL"
-        )
-        cursor.execute("UPDATE users SET max_shops=NULL, max_knowledge_bases=NULL WHERE role='admin'")
-
-        cursor.execute(
-            "SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS "
             "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='shops' AND COLUMN_NAME='expire_time'",
             (mysql.database,),
         )
@@ -677,84 +632,27 @@ class Database:
             cursor.execute("ALTER TABLE runtime_logs ADD COLUMN pid INT NULL")
             logger.info("migration: added pid column to runtime_logs")
 
-        for table_name, create_sql in (
-            (
-                "server_status_collectors",
-                """
-                CREATE TABLE server_status_collectors (
-                    node_id VARCHAR(128) PRIMARY KEY,
-                    hostname VARCHAR(255) NOT NULL,
-                    pid INT NOT NULL,
-                    status VARCHAR(32) NOT NULL DEFAULT 'starting',
-                    latest_json LONGTEXT NULL,
-                    last_error TEXT NULL,
-                    heartbeat_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    lease_expires_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    INDEX idx_server_collectors_heartbeat (heartbeat_at),
-                    INDEX idx_server_collectors_lease (lease_expires_at)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-                """,
-            ),
-            (
-                "server_status_snapshots",
-                """
-                CREATE TABLE server_status_snapshots (
-                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-                    node_id VARCHAR(128) NOT NULL,
-                    collected_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    cpu_percent DECIMAL(6,2) NOT NULL DEFAULT 0,
-                    load1 DECIMAL(8,3) NOT NULL DEFAULT 0,
-                    load5 DECIMAL(8,3) NOT NULL DEFAULT 0,
-                    load15 DECIMAL(8,3) NOT NULL DEFAULT 0,
-                    memory_percent DECIMAL(6,2) NOT NULL DEFAULT 0,
-                    swap_percent DECIMAL(6,2) NOT NULL DEFAULT 0,
-                    disk_percent DECIMAL(6,2) NOT NULL DEFAULT 0,
-                    net_recv_bps DOUBLE NOT NULL DEFAULT 0,
-                    net_sent_bps DOUBLE NOT NULL DEFAULT 0,
-                    disk_read_bps DOUBLE NOT NULL DEFAULT 0,
-                    disk_write_bps DOUBLE NOT NULL DEFAULT 0,
-                    connection_count INT NOT NULL DEFAULT 0,
-                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    INDEX idx_server_snapshots_time (collected_at),
-                    INDEX idx_server_snapshots_node_time (node_id, collected_at)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-                """,
-            ),
-            (
-                "server_status_rollups_hourly",
-                """
-                CREATE TABLE server_status_rollups_hourly (
-                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-                    node_id VARCHAR(128) NOT NULL,
-                    bucket_start TIMESTAMP NOT NULL,
-                    sample_count INT NOT NULL DEFAULT 0,
-                    avg_cpu_percent DECIMAL(6,2) NOT NULL DEFAULT 0,
-                    max_cpu_percent DECIMAL(6,2) NOT NULL DEFAULT 0,
-                    avg_memory_percent DECIMAL(6,2) NOT NULL DEFAULT 0,
-                    max_memory_percent DECIMAL(6,2) NOT NULL DEFAULT 0,
-                    avg_disk_percent DECIMAL(6,2) NOT NULL DEFAULT 0,
-                    max_disk_percent DECIMAL(6,2) NOT NULL DEFAULT 0,
-                    avg_load1 DECIMAL(8,3) NOT NULL DEFAULT 0,
-                    avg_net_recv_bps DOUBLE NOT NULL DEFAULT 0,
-                    avg_net_sent_bps DOUBLE NOT NULL DEFAULT 0,
-                    avg_connection_count DECIMAL(10,2) NOT NULL DEFAULT 0,
-                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    UNIQUE KEY uk_server_rollup_node_bucket (node_id, bucket_start),
-                    INDEX idx_server_rollups_bucket (bucket_start)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-                """,
-            ),
-        ):
+        # 配额/数量限制体系已移除：清理 users 表遗留的限制列。
+        for legacy_user_column in ("max_shops", "max_knowledge_bases", "max_llm_replies", "llm_reply_count"):
+            cursor.execute(
+                "SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='users' AND COLUMN_NAME=%s",
+                (mysql.database, legacy_user_column),
+            )
+            if cursor.fetchone()["cnt"]:
+                cursor.execute(f"ALTER TABLE users DROP COLUMN {legacy_user_column}")
+                logger.info("migration: dropped legacy users.%s column", legacy_user_column)
+
+        # 服务器状态监控功能已移除：清理历史部署遗留的三张表（无业务数据价值）。
+        for legacy_status_table in ("server_status_collectors", "server_status_snapshots", "server_status_rollups_hourly"):
             cursor.execute(
                 "SELECT COUNT(*) AS cnt FROM information_schema.TABLES "
                 "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s",
-                (mysql.database, table_name),
+                (mysql.database, legacy_status_table),
             )
-            if cursor.fetchone()["cnt"] == 0:
-                cursor.execute(create_sql)
-                logger.info("migration: created %s table", table_name)
+            if cursor.fetchone()["cnt"]:
+                cursor.execute(f"DROP TABLE {legacy_status_table}")
+                logger.info("migration: dropped legacy %s table", legacy_status_table)
 
         cursor.execute(
             "SELECT COUNT(*) AS cnt FROM information_schema.STATISTICS "
@@ -876,7 +774,7 @@ REQUIRED_SCHEMA = {
     "roles": ["name", "display_name"],
     "users": [
         "id", "username", "password_hash", "auth_version", "display_name", "role", "is_active",
-        "max_shops", "max_knowledge_bases", "max_llm_replies", "llm_reply_count", "created_at", "updated_at",
+        "created_at", "updated_at",
     ],
     "shops": [
         "id", "name", "remark", "mall_id", "status", "auto_reply_enabled",
@@ -961,23 +859,6 @@ REQUIRED_SCHEMA = {
         "conversation_id", "user_uid", "request_id", "run_id", "pid",
         "error_trace", "context_json", "created_at",
     ],
-    "server_status_collectors": [
-        "node_id", "hostname", "pid", "status", "latest_json", "last_error",
-        "heartbeat_at", "lease_expires_at", "updated_at",
-    ],
-    "server_status_snapshots": [
-        "id", "node_id", "collected_at", "cpu_percent", "load1", "load5",
-        "load15", "memory_percent", "swap_percent", "disk_percent",
-        "net_recv_bps", "net_sent_bps", "disk_read_bps", "disk_write_bps",
-        "connection_count", "created_at",
-    ],
-    "server_status_rollups_hourly": [
-        "id", "node_id", "bucket_start", "sample_count", "avg_cpu_percent",
-        "max_cpu_percent", "avg_memory_percent", "max_memory_percent",
-        "avg_disk_percent", "max_disk_percent", "avg_load1",
-        "avg_net_recv_bps", "avg_net_sent_bps", "avg_connection_count",
-        "created_at", "updated_at",
-    ],
     "shop_notes": [
         "id", "shop_id", "content", "created_by", "created_at", "updated_at",
     ],
@@ -1018,10 +899,6 @@ SCHEMA = [
         display_name VARCHAR(128) NOT NULL,
         role VARCHAR(32) NOT NULL,
         is_active TINYINT(1) NOT NULL DEFAULT 1,
-        max_shops INT NULL,
-        max_knowledge_bases INT NULL,
-        max_llm_replies INT NOT NULL DEFAULT 0 COMMENT 'finite LLM call quota; 0 means no quota',
-        llm_reply_count INT NOT NULL DEFAULT 0,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         CONSTRAINT fk_users_role FOREIGN KEY (role) REFERENCES roles(name)
@@ -1376,65 +1253,6 @@ SCHEMA = [
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         INDEX idx_runtime_logs_created (created_at),
         INDEX idx_runtime_logs_shop (shop_id, created_at)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS server_status_collectors (
-        node_id VARCHAR(128) PRIMARY KEY,
-        hostname VARCHAR(255) NOT NULL,
-        pid INT NOT NULL,
-        status VARCHAR(32) NOT NULL DEFAULT 'starting',
-        latest_json LONGTEXT NULL,
-        last_error TEXT NULL,
-        heartbeat_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        lease_expires_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        INDEX idx_server_collectors_heartbeat (heartbeat_at),
-        INDEX idx_server_collectors_lease (lease_expires_at)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS server_status_snapshots (
-        id BIGINT PRIMARY KEY AUTO_INCREMENT,
-        node_id VARCHAR(128) NOT NULL,
-        collected_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        cpu_percent DECIMAL(6,2) NOT NULL DEFAULT 0,
-        load1 DECIMAL(8,3) NOT NULL DEFAULT 0,
-        load5 DECIMAL(8,3) NOT NULL DEFAULT 0,
-        load15 DECIMAL(8,3) NOT NULL DEFAULT 0,
-        memory_percent DECIMAL(6,2) NOT NULL DEFAULT 0,
-        swap_percent DECIMAL(6,2) NOT NULL DEFAULT 0,
-        disk_percent DECIMAL(6,2) NOT NULL DEFAULT 0,
-        net_recv_bps DOUBLE NOT NULL DEFAULT 0,
-        net_sent_bps DOUBLE NOT NULL DEFAULT 0,
-        disk_read_bps DOUBLE NOT NULL DEFAULT 0,
-        disk_write_bps DOUBLE NOT NULL DEFAULT 0,
-        connection_count INT NOT NULL DEFAULT 0,
-        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        INDEX idx_server_snapshots_time (collected_at),
-        INDEX idx_server_snapshots_node_time (node_id, collected_at)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS server_status_rollups_hourly (
-        id BIGINT PRIMARY KEY AUTO_INCREMENT,
-        node_id VARCHAR(128) NOT NULL,
-        bucket_start TIMESTAMP NOT NULL,
-        sample_count INT NOT NULL DEFAULT 0,
-        avg_cpu_percent DECIMAL(6,2) NOT NULL DEFAULT 0,
-        max_cpu_percent DECIMAL(6,2) NOT NULL DEFAULT 0,
-        avg_memory_percent DECIMAL(6,2) NOT NULL DEFAULT 0,
-        max_memory_percent DECIMAL(6,2) NOT NULL DEFAULT 0,
-        avg_disk_percent DECIMAL(6,2) NOT NULL DEFAULT 0,
-        max_disk_percent DECIMAL(6,2) NOT NULL DEFAULT 0,
-        avg_load1 DECIMAL(8,3) NOT NULL DEFAULT 0,
-        avg_net_recv_bps DOUBLE NOT NULL DEFAULT 0,
-        avg_net_sent_bps DOUBLE NOT NULL DEFAULT 0,
-        avg_connection_count DECIMAL(10,2) NOT NULL DEFAULT 0,
-        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        UNIQUE KEY uk_server_rollup_node_bucket (node_id, bucket_start),
-        INDEX idx_server_rollups_bucket (bucket_start)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """,
     """

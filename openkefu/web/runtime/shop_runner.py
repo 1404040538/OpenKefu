@@ -77,6 +77,8 @@ class ShopRunner:
         self.return_records = ReturnRecordService(db, hub, runtime_logger)
         self.reply_cache = reply_cache
         self.manager = manager
+        from openkefu.web.repositories import Repositories
+        self.repos = Repositories(db)
         self.lock = threading.RLock()
         self.login: Login | None = None
         self.customer_service: CustomerServiceClient | None = None
@@ -112,7 +114,6 @@ class ShopRunner:
 
     def login_shop(self) -> dict[str, Any]:
         with self.lock:
-            self._require_creator_llm_quota("大模型调用额度不足，无法登入店铺")
             self._disconnect_customer_service(update_session=True)
             with self.reply_state_lock:
                 self.pending_reply_messages.clear()
@@ -128,7 +129,6 @@ class ShopRunner:
             if verify_code:
                 return self._complete_password_login(verify_code)
 
-            self._require_creator_llm_quota("大模型调用额度不足，无法登入店铺")
             self._disconnect_customer_service(update_session=True)
             with self.reply_state_lock:
                 self.pending_reply_messages.clear()
@@ -162,7 +162,6 @@ class ShopRunner:
 
     def online(self) -> dict[str, Any]:
         with self.lock:
-            self._require_creator_llm_quota("大模型调用额度不足，无法上线店铺")
             if isinstance(self.listener, dict) and self.listener.get("client"):
                 self._start_latest_conversations_sync(reason="already_online")
                 return {"status": "online", "shop": self._shop_row()}
@@ -211,10 +210,7 @@ class ShopRunner:
                     error=exc,
                 )
         if update_session and self.session_id:
-            self.db.execute(
-                "UPDATE shop_sessions SET status=%s, ended_at=NOW() WHERE id=%s",
-                (session_status, self.session_id),
-            )
+            self.repos.shops.end_session(self.session_id, session_status)
         self.listener = None
         self.customer_service = None
         self.transfer_client = None
@@ -224,13 +220,10 @@ class ShopRunner:
         self.session_id = None
 
     def latest_qrcode(self) -> str | None:
-        row = self.db.query_one(
-            "SELECT id FROM qr_login_attempts WHERE shop_id=%s ORDER BY id DESC LIMIT 1",
-            (self.shop_id,),
-        )
-        if not row:
+        attempt_id = self.repos.shops.latest_qr_attempt_id(self.shop_id)
+        if not attempt_id:
             return None
-        return f"/api/shops/{self.shop_id}/qrcode?attempt_id={row['id']}"
+        return f"/api/shops/{self.shop_id}/qrcode?attempt_id={attempt_id}"
 
     def _run_login_flow(self) -> None:
         try:
@@ -241,16 +234,10 @@ class ShopRunner:
                 raise RuntimeError("failed to get valid qrcode info")
             
             qrcode_path = self._save_qrcode(qrcode_info["uri"])
-            self.session_id = self.db.execute(
-                "INSERT INTO shop_sessions (shop_id, status) VALUES (%s, 'qr_pending')",
-                (self.shop_id,),
-            )
-            attempt_id = self.db.execute(
-                """
-                INSERT INTO qr_login_attempts (shop_id, session_id, token, qrcode_path, status)
-                VALUES (%s,%s,%s,%s,'pending')
-                """,
-                (self.shop_id, self.session_id, qrcode_info["token"], str(qrcode_path)),
+            self.session_id = self.repos.shops.create_session(self.shop_id, "qr_pending")
+            attempt_id = self.repos.shops.create_qr_attempt(
+                shop_id=self.shop_id, session_id=self.session_id,
+                token=qrcode_info["token"], qrcode_path=str(qrcode_path),
             )
             self._set_shop_status("qr_pending")
             # 状态变化必须推送 shop_status，否则前端卡片停留在旧状态（不自动更新）
@@ -288,10 +275,7 @@ class ShopRunner:
                     on_status=on_login_status,
                 )
             except Exception as poll_exc:
-                self.db.execute(
-                    "UPDATE qr_login_attempts SET status='failed', error=%s, completed_at=NOW() WHERE id=%s",
-                    (str(poll_exc), attempt_id),
-                )
+                self.repos.shops.fail_qr_attempt(attempt_id, str(poll_exc))
                 raise
 
             identity = CustomerServiceClient._pass_id_identity(login_result.get("cookies") or {})
@@ -301,25 +285,12 @@ class ShopRunner:
                 self.mall_id = new_mall_id
             with self.db.connect() as conn:
                 with conn.cursor() as cursor:
-                    cursor.execute(
-                        "UPDATE qr_login_attempts SET status='success', query_result=%s, completed_at=NOW() WHERE id=%s",
-                        (json_dumps(login_result.get("query") or {}), attempt_id),
+                    self.repos.shops.succeed_qr_attempt(
+                        attempt_id, json_dumps(login_result.get("query") or {}), cursor=cursor,
                     )
                     self._store_login_cache_cursor(cursor, login_result)
-                    cursor.execute(
-                        """
-                        UPDATE shops SET status='logged_in', mall_id=%s, last_error=NULL WHERE id=%s
-                        """,
-                        (self.mall_id, self.shop_id),
-                    )
-                    cursor.execute(
-                        """
-                        UPDATE shop_sessions
-                        SET status='logged_in', mall_id=%s
-                        WHERE id=%s
-                        """,
-                        (self.mall_id, self.session_id),
-                    )
+                    self.repos.shops.mark_logged_in(self.shop_id, self.mall_id, cursor=cursor)
+                    self.repos.shops.mark_session_logged_in(self.session_id, self.mall_id, cursor=cursor)
             self.hub.publish({"type": "shop_status", "data": self._shop_row()})
             self.runtime_logger.log(
                 "INFO",
@@ -356,20 +327,10 @@ class ShopRunner:
                 self.mall_id = new_mall_id
             with self.db.connect() as conn:
                 with conn.cursor() as cursor:
-                    cursor.execute(
-                        "INSERT INTO shop_sessions (shop_id, status) VALUES (%s, 'login_success')",
-                        (self.shop_id,),
-                    )
-                    self.session_id = cursor.lastrowid
+                    self.session_id = self.repos.shops.create_session(self.shop_id, "login_success", cursor=cursor)
                     self._store_login_cache_cursor(cursor, login_result)
-                    cursor.execute(
-                        "UPDATE shops SET status='logged_in', mall_id=%s, last_error=NULL WHERE id=%s",
-                        (self.mall_id, self.shop_id),
-                    )
-                    cursor.execute(
-                        "UPDATE shop_sessions SET status='logged_in', mall_id=%s WHERE id=%s",
-                        (self.mall_id, self.session_id),
-                    )
+                    self.repos.shops.mark_logged_in(self.shop_id, self.mall_id, cursor=cursor)
+                    self.repos.shops.mark_session_logged_in(self.session_id, self.mall_id, cursor=cursor)
             self.hub.publish({"type": "shop_status", "data": self._shop_row()})
             self.runtime_logger.log(
                 "INFO", __name__, "shop.password_login",
@@ -441,10 +402,8 @@ class ShopRunner:
         if verify_type != "mobile":
             self._password_login_state = None
             message = "password login requires captcha verification; manual captcha flow is not supported"
-            self.db.execute(
-                "UPDATE shops SET status='error', last_error=%s WHERE id=%s",
-                (message, self.shop_id),
-            )
+            self.repos.shops.mark_shop_offline_with_error(self.shop_id, "error") if False else \
+            self.repos.shops.set_status_with_error(self.shop_id, "error", message)
             self.hub.publish({"type": "shop_status", "data": self._shop_row()})
             raise RuntimeError(message)
 
@@ -466,10 +425,7 @@ class ShopRunner:
             "expires_at": time.time() + self.PASSWORD_VERIFY_TTL_SECONDS,
             "attempts": 0,
         }
-        self.db.execute(
-            "UPDATE shops SET status='login_pending', last_error=NULL WHERE id=%s",
-            (self.shop_id,),
-        )
+        self.repos.shops.set_status(self.shop_id, "login_pending")
         self.runtime_logger.log(
             "WARNING",
             __name__,
@@ -488,53 +444,31 @@ class ShopRunner:
         return payload
 
     def _set_login_progress(self, status: str, attempt_id: int, query_result: dict[str, Any] | None = None) -> None:
-        query_json = json_dumps(query_result or {})
-        self.db.execute(
-            "UPDATE qr_login_attempts SET status=%s, query_result=%s WHERE id=%s",
-            (status, query_json, attempt_id),
-        )
+        self.repos.shops.update_qr_attempt(attempt_id, {"status": status, "query_result": json_dumps(query_result or {})})
         if self.session_id:
-            self.db.execute(
-                "UPDATE shop_sessions SET status=%s WHERE id=%s",
-                (status, self.session_id),
-            )
+            self.repos.shops.update_session(self.session_id, {"status": status})
         self._set_shop_status(status)
         self.hub.publish({"type": "shop_status", "data": self._shop_row()})
 
     def _store_login_cache(self, login_result: dict[str, Any]) -> None:
-        self.db.execute(
-            self._login_cache_upsert_sql(),
-            self._login_cache_values(login_result),
-        )
-
-    @staticmethod
-    def _login_cache_upsert_sql() -> str:
-        return """
-            INSERT INTO shop_login_caches
-            (shop_id, cookies_json, cookie_string, requests_headers_json, base_headers_json, login_result_json)
-            VALUES (%s,%s,%s,%s,%s,%s)
-            ON DUPLICATE KEY UPDATE
-                cookies_json=VALUES(cookies_json),
-                cookie_string=VALUES(cookie_string),
-                requests_headers_json=VALUES(requests_headers_json),
-                base_headers_json=VALUES(base_headers_json),
-                login_result_json=VALUES(login_result_json)
-            """
-
-    def _login_cache_values(self, login_result: dict[str, Any]) -> tuple[Any, ...]:
-        return (
-            self.shop_id,
-            self._encrypt_secret_text(json_dumps(login_result.get("cookies") or {})),
-            self._encrypt_secret_text(login_result.get("cookie_string") or ""),
-            self._encrypt_secret_text(json_dumps(login_result.get("requests_headers") or {})),
-            self._encrypt_secret_text(json_dumps(login_result.get("base_headers") or {})),
-            self._encrypt_secret_text(json_dumps(login_result)),
+        self.repos.shops.upsert_login_cache(
+            shop_id=self.shop_id,
+            cookies_json=self._encrypt_secret_text(json_dumps(login_result.get("cookies") or {})),
+            cookie_string=self._encrypt_secret_text(login_result.get("cookie_string") or ""),
+            requests_headers_json=self._encrypt_secret_text(json_dumps(login_result.get("requests_headers") or {})),
+            base_headers_json=self._encrypt_secret_text(json_dumps(login_result.get("base_headers") or {})),
+            login_result_json=self._encrypt_secret_text(json_dumps(login_result)),
         )
 
     def _store_login_cache_cursor(self, cursor: Any, login_result: dict[str, Any]) -> None:
-        cursor.execute(
-            self._login_cache_upsert_sql(),
-            self._login_cache_values(login_result),
+        self.repos.shops.upsert_login_cache(
+            shop_id=self.shop_id,
+            cookies_json=self._encrypt_secret_text(json_dumps(login_result.get("cookies") or {})),
+            cookie_string=self._encrypt_secret_text(login_result.get("cookie_string") or ""),
+            requests_headers_json=self._encrypt_secret_text(json_dumps(login_result.get("requests_headers") or {})),
+            base_headers_json=self._encrypt_secret_text(json_dumps(login_result.get("base_headers") or {})),
+            login_result_json=self._encrypt_secret_text(json_dumps(login_result)),
+            cursor=cursor,
         )
 
     def _encrypt_secret_text(self, value: str | None) -> str | None:
@@ -564,7 +498,7 @@ class ShopRunner:
         if not cookies:
             return
         cookie_string = "; ".join(f"{key}={value}" for key, value in cookies.items() if value)
-        row = self.db.query_one("SELECT login_result_json FROM shop_login_caches WHERE shop_id=%s", (self.shop_id,))
+        row = self.repos.shops.login_result_cache(self.shop_id)
         login_result = self._load_secret_json((row or {}).get("login_result_json"), {})
         if not isinstance(login_result, dict):
             login_result = {}
@@ -572,26 +506,16 @@ class ShopRunner:
         login_result["cookie_string"] = cookie_string
         login_result["base_headers"] = getattr(self.login, "base_headers", {}) or {}
         login_result["fingerprint_env"] = getattr(self.login, "fingerprint_env", {}) or {}
-        self.db.execute(
-            """
-            UPDATE shop_login_caches
-            SET cookies_json=%s,
-                cookie_string=%s,
-                base_headers_json=%s,
-                login_result_json=%s
-            WHERE shop_id=%s
-            """,
-            (
-                self._encrypt_secret_text(json_dumps(cookies)),
-                self._encrypt_secret_text(cookie_string),
-                self._encrypt_secret_text(json_dumps(getattr(self.login, "base_headers", {}) or {})),
-                self._encrypt_secret_text(json_dumps(login_result)),
-                self.shop_id,
-            ),
+        self.repos.shops.update_login_cache_cookies(
+            self.shop_id,
+            cookies_json=self._encrypt_secret_text(json_dumps(cookies)),
+            cookie_string=self._encrypt_secret_text(cookie_string),
+            base_headers_json=self._encrypt_secret_text(json_dumps(getattr(self.login, "base_headers", {}) or {})),
+            login_result_json=self._encrypt_secret_text(json_dumps(login_result)),
         )
 
     def _login_from_cache(self) -> Login:
-        row = self.db.query_one("SELECT * FROM shop_login_caches WHERE shop_id=%s", (self.shop_id,))
+        row = self.repos.shops.login_cache(self.shop_id)
         if not row:
             raise RuntimeError("店铺还没有登录缓存，请先扫码登入")
         cookies = self._load_secret_json(row.get("cookies_json"), {})
@@ -628,7 +552,7 @@ class ShopRunner:
         login.fingerprint_env = env
 
     def _new_login_with_cached_context(self) -> Login:
-        row = self.db.query_one("SELECT * FROM shop_login_caches WHERE shop_id=%s", (self.shop_id,))
+        row = self.repos.shops.login_cache(self.shop_id)
         if not row:
             return Login()
         cookies = self._load_secret_json(row.get("cookies_json"), {})
@@ -696,10 +620,7 @@ class ShopRunner:
             self.transfer_client = CustomerTransferClient(self.customer_service)
             self.goods_service = GoodsService(self.login)
             self.order_service = OrderService(self.login)
-            self.session_id = self.db.execute(
-                "INSERT INTO shop_sessions (shop_id, status) VALUES (%s, 'connecting')",
-                (self.shop_id,),
-            )
+            self.session_id = self.repos.shops.create_session(self.shop_id, "connecting")
             version = self.customer_service.get_version()
             self.token_result = self._normalize_token_result(self.customer_service.get_token())
             new_mall_id = str(self.token_result.get("mall_id") or self.mall_id or "")
@@ -709,23 +630,20 @@ class ShopRunner:
             self_nickname = str(self.token_result.get("nickname") or "")
             access_token = self._access_token_from_token_result(self.token_result)
             ws_base_url = self.token_result.get("use_ip")
-            self.db.execute(
-                "UPDATE shops SET status='online', mall_id=%s, nickname=%s, last_error=NULL WHERE id=%s",
-                (self.mall_id, self_nickname if self_nickname else None, self.shop_id),
+            self.repos.shops.mark_online(
+                self.shop_id,
+                mall_id=self.mall_id,
+                nickname=self_nickname if self_nickname else None,
             )
-            self.db.execute(
-                """
-                UPDATE shop_sessions
-                SET status='online', mall_id=%s, access_token=%s, ws_base_url=%s, token_result=%s
-                WHERE id=%s
-                """,
-                (
-                    self.mall_id,
-                    self._encrypt_secret_text(access_token),
-                    ws_base_url,
-                    self._encrypt_secret_text(json_dumps(self.token_result)),
-                    self.session_id,
-                ),
+            self.repos.shops.update_session(
+                self.session_id,
+                {
+                    "status": "online",
+                    "mall_id": self.mall_id,
+                    "access_token": self._encrypt_secret_text(access_token),
+                    "ws_base_url": ws_base_url,
+                    "token_result": self._encrypt_secret_text(json_dumps(self.token_result)),
+                },
             )
             self.hub.publish({"type": "shop_status", "data": self._shop_row()})
             self.runtime_logger.log(
@@ -751,10 +669,7 @@ class ShopRunner:
             failed_session_id = self.session_id
             self.listener = None
             if failed_session_id:
-                self.db.execute(
-                    "UPDATE shop_sessions SET status='error', ended_at=NOW(), error=COALESCE(error, 'listener startup failed') WHERE id=%s",
-                    (failed_session_id,),
-                )
+                self.repos.shops.end_session_with_error(failed_session_id, "listener startup failed")
             # 登录态过期（getToken 43001 会话已过期）时，尝试用保存的账密自动重新登录，
             # 成功后继续连接流程，避免每次都要人工重新扫码。
             if self._send_session_expired(exc):
@@ -767,10 +682,7 @@ class ShopRunner:
             raise
 
     def _saved_credentials(self) -> dict[str, str] | None:
-        row = self.db.query_one(
-            "SELECT login_username, login_password FROM shops WHERE id=%s",
-            (self.shop_id,),
-        )
+        row = self.repos.shops.saved_credentials(self.shop_id)
         if not row:
             return None
         try:
@@ -971,15 +883,13 @@ class ShopRunner:
             new_mall_id = str(token_result.get("mall_id") or self.mall_id or "")
             if new_mall_id:
                 self._assert_shop_identity(new_mall_id, source="hot_reconnect")
-            session_id = self.db.execute(
-                "INSERT INTO shop_sessions (shop_id, status, mall_id, access_token, ws_base_url, token_result) VALUES (%s,'connecting',%s,%s,%s,%s)",
-                (
-                    self.shop_id,
-                    new_mall_id or self.mall_id,
-                    self._encrypt_secret_text(access_token),
-                    token_result.get("use_ip"),
-                    self._encrypt_secret_text(json_dumps(token_result)),
-                ),
+            session_id = self.repos.shops.create_session(
+                self.shop_id,
+                "connecting",
+                mall_id=new_mall_id or self.mall_id,
+                access_token=self._encrypt_secret_text(access_token),
+                ws_base_url=token_result.get("use_ip"),
+                token_result=self._encrypt_secret_text(json_dumps(token_result)),
             )
             def on_candidate_error(error):
                 # A failed candidate must not mark the active, older session dead.
@@ -1001,14 +911,8 @@ class ShopRunner:
             if listener.get("ready_error") or listener.get("error"):
                 raise listener.get("ready_error") or listener["error"]
             with self.lock:
-                self.db.execute(
-                    "UPDATE shop_sessions SET status='online', mall_id=%s WHERE id=%s",
-                    (new_mall_id or self.mall_id, session_id),
-                )
-                self.db.execute(
-                    "UPDATE shops SET status='online', mall_id=%s, last_error=NULL WHERE id=%s",
-                    (new_mall_id or self.mall_id, self.shop_id),
-                )
+                self.repos.shops.update_session(session_id, {"status": "online", "mall_id": new_mall_id or self.mall_id})
+                self.repos.shops.set_status(self.shop_id, "online", mall_id=new_mall_id or self.mall_id)
                 self.login = new_login
                 self.customer_service = new_customer_service
                 self.transfer_client = new_transfer_client
@@ -1023,10 +927,7 @@ class ShopRunner:
             if old_client:
                 old_client.close()
             if old_state.get("session_id"):
-                self.db.execute(
-                    "UPDATE shop_sessions SET status='replaced', ended_at=NOW() WHERE id=%s",
-                    (old_state["session_id"],),
-                )
+                self.repos.shops.end_session(old_state["session_id"], "replaced")
             self.hub.publish({"type": "shop_status", "data": self._shop_row()})
             self.runtime_logger.log(
                 "INFO",
@@ -1516,7 +1417,7 @@ class ShopRunner:
             or token_result.get("mallID")
         )
         if not mall_id:
-            row = self.db.query_one("SELECT mall_id FROM shops WHERE id=%s", (self.shop_id,))
+            row = self.repos.conversations.shop_mall_id(self.shop_id)
             mall_id = row.get("mall_id") if row else ""
         return str(mall_id or "")
 
@@ -1524,12 +1425,9 @@ class ShopRunner:
         new_mall_id = str(new_mall_id or "")
         if not new_mall_id:
             return
-        shop = self.db.query_one("SELECT mall_id, name FROM shops WHERE id=%s", (self.shop_id,))
+        shop = self.repos.shops.get_mall_and_name(self.shop_id)
         old_mall_id = str((shop or {}).get("mall_id") or "")
-        owner = self.db.query_one(
-            "SELECT id, name FROM shops WHERE mall_id=%s AND id<>%s LIMIT 1",
-            (new_mall_id, self.shop_id),
-        )
+        owner = self.repos.shops.mall_owner(new_mall_id, exclude_shop_id=self.shop_id)
         if owner:
             self._invalidate_login_cache()
             self.runtime_logger.log(
@@ -1580,19 +1478,12 @@ class ShopRunner:
         new_mall_id = str(new_mall_id or "")
         if not new_mall_id:
             return
-        shop = self.db.query_one("SELECT mall_id FROM shops WHERE id=%s", (self.shop_id,))
+        shop = self.repos.conversations.shop_mall_id(self.shop_id)
         old_mall_id = str((shop or {}).get("mall_id") or "")
         if not old_mall_id or old_mall_id == new_mall_id:
             return
 
-        self.db.execute(
-            """
-            UPDATE conversations
-            SET mall_id=%s
-            WHERE shop_id=%s AND (mall_id IS NULL OR mall_id='')
-            """,
-            (old_mall_id, self.shop_id),
-        )
+        self.repos.conversations.backfill_mall_id(self.shop_id, old_mall_id)
         self.runtime_logger.log(
             "WARNING",
             __name__,
@@ -1611,31 +1502,18 @@ class ShopRunner:
         if not user_uid:
             user_uid = "unknown"
         mall_id = self._active_mall_id() or None
-        conversation = self.db.query_one(
-            "SELECT * FROM conversations WHERE shop_id=%s AND user_uid=%s AND mall_id <=> %s",
-            (self.shop_id, user_uid, mall_id),
-        )
+        preview = f"[{event.get('type') or 'unknown'}]"
+        conversation = self.repos.conversations.by_shop_uid_mall(self.shop_id, user_uid, mall_id)
         if conversation:
             conversation_id = int(conversation["id"])
-            self.db.execute(
-                "UPDATE conversations SET mall_id=%s, last_message_preview=%s, unread_count=unread_count+1 WHERE id=%s",
-                (mall_id, f"[{event.get('type') or 'unknown'}]", conversation_id),
-            )
+            self.repos.conversations.touch_unknown_event(conversation_id, mall_id=mall_id, preview=preview)
         else:
-            conversation_id = self.db.execute(
-                """
-                INSERT INTO conversations (shop_id, mall_id, conv_id, user_uid, last_message_preview, unread_count)
-                VALUES (%s,%s,%s,%s,%s,1)
-                """,
-                (self.shop_id, mall_id, user_uid, user_uid, f"[{event.get('type') or 'unknown'}]"),
+            conversation_id = self.repos.conversations.create_unknown_event_conversation(
+                shop_id=self.shop_id, mall_id=mall_id, user_uid=user_uid, preview=preview,
             )
-        return self.db.execute(
-            """
-            INSERT INTO messages
-            (shop_id, conversation_id, direction, user_uid, sender_role, kind, content, raw_json, status)
-            VALUES (%s,%s,'system',%s,'system','unknown',%s,%s,'received')
-            """,
-            (self.shop_id, conversation_id, user_uid, f"[{event.get('type') or 'unknown'}]", json_dumps(payload)),
+        return self.repos.conversations.insert_unknown_event_message(
+            shop_id=self.shop_id, conversation_id=conversation_id, user_uid=user_uid,
+            preview=preview, raw_json=json_dumps(payload),
         )
 
     @staticmethod
@@ -1663,94 +1541,51 @@ class ShopRunner:
         context = user_message.get("_reply_context") if isinstance(user_message.get("_reply_context"), dict) else {}
         conv_id = context.get("conv_id") or user_message.get("conv_id") or user_uid
         mall_id = self._active_mall_id() or None
-        conversation = self.db.query_one(
-            "SELECT * FROM conversations WHERE shop_id=%s AND user_uid=%s AND mall_id <=> %s",
-            (self.shop_id, user_uid, mall_id),
-        )
+        conversation = self.repos.conversations.by_shop_uid_mall(self.shop_id, user_uid, mall_id)
+        conv_params = {
+            "shop_id": self.shop_id,
+            "mall_id": mall_id,
+            "conv_id": str(conv_id or ""),
+            "chat_type_id": str(context.get("chat_type_id") or ""),
+            "chat_type": str(context.get("chat_type") or ""),
+            "user_uid": user_uid,
+            "nickname": summary.get("nickname") or "",
+            "preview": str(summary.get("content") or "")[:512],
+            "message_at": message_at,
+            "unread_delta": 0 if is_system else 1,
+        }
         if conversation:
             conversation_id = int(conversation["id"])
-            nickname = summary.get("nickname") or conversation.get("nickname") or ""
-            self.db.execute(
-                """
-                UPDATE conversations
-                SET mall_id=%s, conv_id=%s, chat_type_id=%s, chat_type=%s, nickname=%s,
-                    last_message_preview=IF(last_message_at IS NULL OR last_message_at<=%s, %s, last_message_preview),
-                    last_message_at=IF(last_message_at IS NULL OR last_message_at<=%s, %s, last_message_at),
-                    unread_count=unread_count+%s
-                WHERE id=%s
-                """,
-                (
-                    mall_id,
-                    str(conv_id or ""),
-                    str(context.get("chat_type_id") or ""),
-                    str(context.get("chat_type") or ""),
-                    nickname,
-                    message_at,
-                    str(summary.get("content") or "")[:512],
-                    message_at,
-                    message_at,
-                    0 if is_system else 1,
-                    conversation_id,
-                ),
-            )
+            conv_params["nickname"] = summary.get("nickname") or conversation.get("nickname") or ""
+            self.repos.conversations.touch_on_message(conversation_id, conv_params)
         else:
             try:
-                conversation_id = self.db.execute(
-                    """
-                    INSERT INTO conversations
-                    (shop_id, mall_id, conv_id, chat_type_id, chat_type, user_uid, nickname,
-                     last_message_preview, last_message_at, unread_count)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    """,
-                    (
-                        self.shop_id,
-                        mall_id,
-                        str(conv_id or ""),
-                        str(context.get("chat_type_id") or ""),
-                        str(context.get("chat_type") or ""),
-                        user_uid,
-                        summary.get("nickname") or "",
-                        str(summary.get("content") or "")[:512],
-                        message_at,
-                        0 if is_system else 1,
-                    ),
-                )
+                conversation_id = self.repos.conversations.create_from_incoming(conv_params)
             except IntegrityError:
                 # 双连接/并发下唯一键 (shop_id, mall_id, user_uid) 冲突：
                 # 回查已存在的会话，按幂等继续入库
-                conversation = self.db.query_one(
-                    "SELECT * FROM conversations WHERE shop_id=%s AND user_uid=%s AND mall_id <=> %s",
-                    (self.shop_id, user_uid, mall_id),
-                )
+                conversation = self.repos.conversations.by_shop_uid_mall(self.shop_id, user_uid, mall_id)
                 if not conversation:
                     raise
                 conversation_id = int(conversation["id"])
 
         try:
-            message_id = self.db.execute(
-                """
-                INSERT INTO messages
-                (shop_id, conversation_id, direction, msg_id, client_msg_id, user_uid,
-                 sender_role, message_type, kind, content, goods_json, size_json, raw_json, message_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """,
-                (
-                    self.shop_id,
-                    conversation_id,
-                    direction,
-                    str(user_message.get("msg_id") or ""),
-                    str(user_message.get("client_msg_id") or ""),
-                    user_uid,
-                    sender_role,
-                    user_message.get("type"),
-                    summary.get("kind") or "unknown",
-                    str(summary.get("content") or ""),
-                    json_dumps(summary.get("goods")) if summary.get("goods") else None,
-                    json_dumps(summary.get("size")) if summary.get("size") else None,
-                    json_dumps(user_message),
-                    message_at,
-                ),
-            )
+            message_id = self.repos.conversations.insert_chat_message({
+                "shop_id": self.shop_id,
+                "conversation_id": conversation_id,
+                "direction": direction,
+                "msg_id": str(user_message.get("msg_id") or ""),
+                "client_msg_id": str(user_message.get("client_msg_id") or ""),
+                "user_uid": user_uid,
+                "sender_role": sender_role,
+                "message_type": user_message.get("type"),
+                "kind": summary.get("kind") or "unknown",
+                "content": str(summary.get("content") or ""),
+                "goods_json": json_dumps(summary.get("goods")) if summary.get("goods") else None,
+                "size_json": json_dumps(summary.get("size")) if summary.get("size") else None,
+                "raw_json": json_dumps(user_message),
+                "message_at": message_at,
+            })
         except IntegrityError:
             # 消息唯一索引 (shop_id, msg_id_key) 冲突：双连接重复推送同一消息，
             # 幂等返回已入库的那一条
@@ -1761,29 +1596,14 @@ class ShopRunner:
         return conversation_id, message_id, True, not is_system
 
     def _existing_message_row(self, message: dict[str, Any]) -> dict[str, Any] | None:
-        msg_id = str(message.get("msg_id") or "")
-        if msg_id:
-            row = self.db.query_one(
-                "SELECT id, conversation_id FROM messages WHERE shop_id=%s AND msg_id=%s LIMIT 1",
-                (self.shop_id, msg_id),
-            )
-            if row:
-                return row
-        client_msg_id = str(message.get("client_msg_id") or "")
-        if client_msg_id:
-            row = self.db.query_one(
-                "SELECT id, conversation_id FROM messages WHERE shop_id=%s AND client_msg_id=%s LIMIT 1",
-                (self.shop_id, client_msg_id),
-            )
-            if row:
-                return row
-        return None
+        return self.repos.conversations.existing_message_row(
+            self.shop_id,
+            msg_id=str(message.get("msg_id") or "") or None,
+            client_msg_id=str(message.get("client_msg_id") or "") or None,
+        )
 
     def _auto_reply_enabled(self) -> bool:
-        row = self.db.query_one(
-            "SELECT auto_reply_enabled, status FROM shops WHERE id=%s",
-            (self.shop_id,),
-        )
+        row = self.repos.shops.auto_reply_state(self.shop_id)
         if not row or not row.get("auto_reply_enabled"):
             return False
         # 防"假在线"：DB 被其他进程标为 offline/error 但本进程 WS 仍存活时，
@@ -1796,11 +1616,7 @@ class ShopRunner:
         return False
 
     def _conversation_bot_reply_enabled(self, conversation_id: int) -> bool:
-        row = self.db.query_one(
-            "SELECT bot_reply_enabled FROM conversations WHERE id=%s AND shop_id=%s",
-            (conversation_id, self.shop_id),
-        )
-        return bool(row and row.get("bot_reply_enabled"))
+        return self.repos.conversations.bot_reply_enabled(conversation_id, self.shop_id)
 
     def _should_schedule_auto_reply(self, conversation_id: int) -> bool:
         return (
@@ -1810,14 +1626,11 @@ class ShopRunner:
         )
 
     def _is_conversation_transferred(self, conversation_id: int) -> bool:
-        row = self.db.query_one(
-            "SELECT transferred_at FROM conversations WHERE id=%s",
-            (conversation_id,),
-        )
-        return row and row.get("transferred_at") is not None
+        row = self.repos.conversations.by_id_plain(conversation_id)
+        return bool(row and row.get("transferred_at") is not None)
 
     def _load_sendable_conversation(self, conversation_id: int) -> dict[str, Any]:
-        conversation = self.db.query_one("SELECT * FROM conversations WHERE id=%s", (conversation_id,))
+        conversation = self.repos.conversations.by_id_plain(conversation_id)
         if not conversation:
             raise ValueError(f"conversation not found: {conversation_id}")
         if int(conversation["shop_id"]) != self.shop_id:
@@ -1832,58 +1645,24 @@ class ShopRunner:
         return conversation
 
     def _is_force_ai_reply(self) -> bool:
-        row = self.db.query_one("SELECT auto_reply_enabled, force_ai_reply FROM shops WHERE id=%s", (self.shop_id,))
+        row = self.repos.shops.get_auto_reply_flags(self.shop_id)
         return bool(row and row.get("auto_reply_enabled") and row.get("force_ai_reply"))
 
     def _get_shop_greeting(self) -> str | None:
-        row = self.db.query_one("SELECT greeting_message FROM shops WHERE id=%s", (self.shop_id,))
-        return row.get("greeting_message") if row else None
+        return self.repos.shops.get_greeting_message(self.shop_id)
 
     def _conversation_has_outbound(self, conversation_id: int) -> bool:
-        row = self.db.query_one(
-            "SELECT COUNT(*) AS cnt FROM messages WHERE conversation_id=%s AND direction='outbound'",
-            (conversation_id,),
-        )
-        return bool(row and row.get("cnt", 0) > 0)
+        return self.repos.conversations.has_outbound(conversation_id)
 
     def _get_shop_transfer_csids(self) -> list[str]:
-        row = self.db.query_one("SELECT transfer_csids FROM shops WHERE id=%s", (self.shop_id,))
-        if not row or not row.get("transfer_csids"):
-            return []
-        try:
-            csids = json.loads(row["transfer_csids"])
-            return [str(csid).strip() for csid in csids if str(csid).strip()] if isinstance(csids, list) else []
-        except (TypeError, ValueError):
-            return []
+        return self.repos.shops.get_transfer_csids(self.shop_id)
 
     def _set_conversation_bot_reply(self, conversation_id: int, enabled: bool) -> None:
-        self.db.execute(
-            "UPDATE conversations SET bot_reply_enabled=%s WHERE id=%s AND shop_id=%s",
-            (int(enabled), conversation_id, self.shop_id),
-        )
+        self.repos.conversations.set_bot_reply_for_shop(conversation_id, self.shop_id, enabled)
 
     def _mark_human_attention(self, conversation_id: int, user_uid: str, reason: str) -> None:
-        self.db.execute(
-            """
-            UPDATE conversations
-            SET bot_reply_enabled=0,
-                human_attention_required=1,
-                human_attention_reason=%s,
-                human_attention_at=NOW()
-            WHERE id=%s AND shop_id=%s
-            """,
-            (reason, conversation_id, self.shop_id),
-        )
-        row = self.db.query_one(
-            """
-            SELECT c.*, s.name AS shop_name, s.status AS shop_status,
-                   s.auto_reply_enabled AS shop_auto_reply_enabled
-            FROM conversations c
-            JOIN shops s ON s.id=c.shop_id
-            WHERE c.id=%s
-            """,
-            (conversation_id,),
-        )
+        self.repos.conversations.mark_human_attention(conversation_id, self.shop_id, reason)
+        row = self.repos.conversations.row(conversation_id)
         if row:
             self.hub.publish({"type": "conversation_attention", "data": row})
         self.runtime_logger.log(
@@ -2073,7 +1852,6 @@ class ShopRunner:
 
         shop_notes = self.note_service.get_items_for_shop(self.shop_id)
 
-        quota_owner, quota_exhausted = self._reserve_creator_llm_quota("大模型回复次数已达上限，所有店铺已下线")
         try:
             intent = analyze_customer_intent(
                 compressed,
@@ -2105,8 +1883,6 @@ class ShopRunner:
                 )
             elif not self._is_force_ai_reply():
                 self._handle_need_human(conversation_id, user_uid, "llm_error")
-            if quota_owner and quota_exhausted:
-                self._quota_exceeded(quota_owner)
             return
 
         handled_return_record = self._handle_return_record_intent(
@@ -2118,8 +1894,6 @@ class ShopRunner:
             knowledge_hits=knowledge_hits,
         )
         if handled_return_record:
-            if quota_owner and quota_exhausted:
-                self._quota_exceeded(quota_owner)
             return
 
         if is_latest_conversations_batch and self._intent_needs_human(intent):
@@ -2143,29 +1917,23 @@ class ShopRunner:
                 slots=intent.get("slots") or {},
             )
             self._handle_need_human(conversation_id, user_uid, "transfer_to_human")
-            if quota_owner and quota_exhausted:
-                self._quota_exceeded(quota_owner)
             return
 
         if self._is_force_ai_reply():
             intent = self._suppress_unwanted_transfer(content, intent, conversation_id)
         intent["reply"] = clean_reply_text(intent.get("reply") or "")
 
-        try:
-            final_reply = self._send_auto_text_reply(
-                conversation_id=conversation_id,
-                message_id=message_id,
-                user_uid=user_uid,
-                content=intent["reply"],
-                history=compressed,
-                knowledge_hits=knowledge_hits,
-                shop_notes=shop_notes or None,
-                business_context=business_context or None,
-            )
-            intent["reply"] = final_reply
-        finally:
-            if quota_owner and quota_exhausted:
-                self._quota_exceeded(quota_owner)
+        final_reply = self._send_auto_text_reply(
+            conversation_id=conversation_id,
+            message_id=message_id,
+            user_uid=user_uid,
+            content=intent["reply"],
+            history=compressed,
+            knowledge_hits=knowledge_hits,
+            shop_notes=shop_notes or None,
+            business_context=business_context or None,
+        )
+        intent["reply"] = final_reply
         if not is_batch and self.reply_cache and self._is_cacheable(content, intent):
             self.reply_cache.put(content, self.shop_id, intent)
         intent_event_id = self._store_intent_event(
@@ -2237,23 +2005,17 @@ class ShopRunner:
         reply = clean_reply_text(str(qa_item.get("reply") or ""))
         image_base64 = str(qa_item.get("image_base64") or "")
         optimized_reply = ""
-        quota_owner = None
-        quota_exhausted = False
         if reply:
-            optimized_reply, quota_owner, quota_exhausted = self._optimize_qa_reply(reply)
-            try:
-                self._send_auto_text_reply(
-                    conversation_id=conversation_id,
-                    message_id=message_id,
-                    user_uid=user_uid,
-                    content=optimized_reply,
-                    context_instruction="原回复来自知识库，重写时必须保持原意和事实，不要新增知识库未提供的信息。",
-                )
-                if image_base64:
-                    self.send_image(conversation_id=conversation_id, image_base64=image_base64)
-            finally:
-                if quota_owner and quota_exhausted:
-                    self._quota_exceeded(quota_owner)
+            optimized_reply = self._optimize_qa_reply(reply)
+            self._send_auto_text_reply(
+                conversation_id=conversation_id,
+                message_id=message_id,
+                user_uid=user_uid,
+                content=optimized_reply,
+                context_instruction="原回复来自知识库，重写时必须保持原意和事实，不要新增知识库未提供的信息。",
+            )
+            if image_base64:
+                self.send_image(conversation_id=conversation_id, image_base64=image_base64)
         elif image_base64:
             self.send_image(conversation_id=conversation_id, image_base64=image_base64)
         self.runtime_logger.log(
@@ -2275,7 +2037,7 @@ class ShopRunner:
         )
 
     def conversation_context(self, conversation_id: int) -> dict[str, Any]:
-        conversation = self.db.query_one("SELECT * FROM conversations WHERE id=%s", (conversation_id,))
+        conversation = self.repos.conversations.by_id_plain(conversation_id)
         if not conversation:
             raise ValueError(f"conversation not found: {conversation_id}")
         if int(conversation["shop_id"]) != self.shop_id:
@@ -2494,16 +2256,7 @@ class ShopRunner:
         }
 
     def _recent_product_cards(self, conversation_id: int) -> list[dict[str, Any]]:
-        rows = self.db.query(
-            """
-            SELECT id, raw_json, message_at, created_at
-            FROM messages
-            WHERE conversation_id=%s AND raw_json IS NOT NULL
-            ORDER BY id DESC
-            LIMIT 80
-            """,
-            (conversation_id,),
-        )
+        rows = self.repos.conversations.raw_json_history(conversation_id, limit=80)
         items: list[dict[str, Any]] = []
         current = self.latest_product_context.get(int(conversation_id))
         if current:
@@ -2917,7 +2670,7 @@ class ShopRunner:
             return True
         return has_product_context and len(normalized.strip()) <= 30
 
-    def _optimize_qa_reply(self, reply: str) -> tuple[str, int | None, bool]:
+    def _optimize_qa_reply(self, reply: str) -> str:
         messages = [
             {
                 "role": "system",
@@ -2925,11 +2678,10 @@ class ShopRunner:
             },
             {"role": "user", "content": reply},
         ]
-        quota_owner, quota_exhausted = self._reserve_creator_llm_quota("大模型回复次数已达上限，所有店铺已下线")
         try:
-            return clean_reply_text(self.llm_client.chat(messages, max_tokens=512, temperature=0.3)), quota_owner, quota_exhausted
+            return clean_reply_text(self.llm_client.chat(messages, max_tokens=512, temperature=0.3))
         except Exception:
-            return reply, quota_owner, quota_exhausted
+            return reply
 
     def _send_cached_or_fast_reply(self, conversation_id: int, message_id: int, user_uid: str,
                                     reply: str, *, source: str, intent: dict[str, Any] | None = None):
@@ -3098,64 +2850,28 @@ class ShopRunner:
         intent: dict[str, Any],
         knowledge_hits: list[dict[str, Any]],
     ) -> int:
-        intent_event_id = self.db.execute(
-            """
-            INSERT INTO intent_events
-            (shop_id, conversation_id, message_id, user_uid, intent_code, raw_intent_code,
-             confidence, resolution_status, reply, slots_json, actions_json, knowledge_json,
-             raw_json, status, error)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'replied',%s)
-            """,
-            (
-                self.shop_id,
-                conversation_id,
-                message_id,
-                user_uid,
-                intent.get("intent_code") or "unknown",
-                intent.get("raw_intent_code") or intent.get("intent_code") or "unknown",
-                float(intent.get("confidence") or 0),
-                intent.get("resolution_status") or "need_human",
-                intent.get("reply") or "",
-                json_dumps(intent.get("slots") or {}),
-                json_dumps(intent.get("actions") or []),
-                json_dumps(knowledge_hits or []),
-                json_dumps(intent.get("raw") or intent),
-                intent.get("error") or None,
-            ),
+        intent_event_id = self.repos.conversations.insert_intent_event(
+            shop_id=self.shop_id,
+            conversation_id=conversation_id,
+            message_id=message_id,
+            user_uid=user_uid,
+            intent=intent,
+            knowledge_hits=knowledge_hits,
         )
-        self.hub.publish({"type": "intent_event", "data": self.db.query_one("SELECT * FROM intent_events WHERE id=%s", (intent_event_id,))})
+        self.hub.publish({"type": "intent_event", "data": self.repos.conversations.row_by_id("intent_events", intent_event_id)})
         return intent_event_id
 
     def _llm_history(self, *, conversation_id: int, current_message_id: int) -> list[dict[str, str]]:
-        sort_expr = (
-            "CASE "
-            "WHEN message_at IS NULL THEN UNIX_TIMESTAMP(created_at) * 1000 "
-            "WHEN message_at < 100000000000 THEN message_at * 1000 "
-            "ELSE message_at END"
-        )
-        current = self.db.query_one(
-            f"SELECT {sort_expr} AS sort_at FROM messages WHERE id=%s",
-            (current_message_id,),
-        )
-        if not current:
+        cutoff = self.repos.conversations.message_sort_at(current_message_id)
+        if cutoff is None:
             return []
-        cutoff = int(current.get("sort_at") or 0)
         boundary_message_id = self._latest_transfer_boundary_message_id(conversation_id, current_message_id)
-        rows = self.db.query(
-            f"""
-            SELECT direction, kind, content, goods_json, raw_json
-            FROM messages
-            WHERE conversation_id=%s
-              AND id>%s
-              AND direction IN ('inbound','outbound')
-              AND (
-                {sort_expr} < %s
-                OR ({sort_expr} = %s AND id <= %s)
-              )
-            ORDER BY {sort_expr} DESC, id DESC
-            LIMIT 11
-            """,
-            (conversation_id, boundary_message_id, cutoff, cutoff, current_message_id),
+        rows = self.repos.conversations.llm_history_rows(
+            conversation_id=conversation_id,
+            after_message_id=boundary_message_id,
+            cutoff=cutoff,
+            current_message_id=current_message_id,
+            limit=11,
         )
         history: list[dict[str, str]] = []
         for row in reversed(rows):
@@ -3166,25 +2882,7 @@ class ShopRunner:
         return history
 
     def _latest_transfer_boundary_message_id(self, conversation_id: int, current_message_id: int) -> int:
-        row = self.db.query_one(
-            """
-            SELECT ie.message_id AS source_message_id,
-                   (
-                     SELECT MIN(m.id)
-                     FROM messages m
-                     WHERE m.conversation_id=ie.conversation_id
-                       AND m.id>ie.message_id
-                       AND m.direction='outbound'
-                   ) AS transfer_reply_message_id
-            FROM intent_events ie
-            WHERE ie.conversation_id=%s
-              AND ie.message_id<%s
-              AND ie.actions_json LIKE %s
-            ORDER BY ie.id DESC
-            LIMIT 1
-            """,
-            (conversation_id, current_message_id, "%transfer_to_human%"),
-        )
+        row = self.repos.conversations.latest_transfer_boundary(conversation_id, current_message_id)
         if not row:
             return 0
         return int(row.get("transfer_reply_message_id") or row.get("source_message_id") or 0)
@@ -3248,26 +2946,18 @@ class ShopRunner:
         if self._is_conversation_transferred(conversation_id):
             raise RuntimeError("会话已转接，无法发送消息，请等待用户回复后重试")
 
-        conversation = self.db.query_one("SELECT * FROM conversations WHERE id=%s", (conversation_id,))
+        conversation = self.repos.conversations.by_id_plain(conversation_id)
         if not conversation:
             raise ValueError(f"conversation not found: {conversation_id}")
         user_uid = str(conversation["user_uid"])
 
-        attempt_id = self.db.execute(
-            """
-            INSERT INTO reply_attempts
-            (shop_id, conversation_id, message_id, user_uid, content, status)
-            VALUES (%s,%s,%s,%s,%s,'sending')
-            """,
-            (self.shop_id, conversation_id, None, user_uid, "[图片]"),
+        attempt_id = self.repos.conversations.insert_reply_attempt(
+            shop_id=self.shop_id, conversation_id=conversation_id, message_id=None,
+            user_uid=user_uid, content="[图片]",
         )
-        message_id = self.db.execute(
-            """
-            INSERT INTO messages
-            (shop_id, conversation_id, direction, user_uid, sender_role, kind, content, status)
-            VALUES (%s,%s,'outbound',%s,'service','image','[图片]','sending')
-            """,
-            (self.shop_id, conversation_id, user_uid),
+        message_id = self.repos.conversations.insert_outbound_message(
+            shop_id=self.shop_id, conversation_id=conversation_id,
+            user_uid=user_uid, kind="image", content="[图片]",
         )
         self.hub.publish({"type": "message", "data": self._message_row(message_id)})
 
@@ -3289,8 +2979,8 @@ class ShopRunner:
                         raise
                     self._recover_send_session(client)
         except Exception as exc:
-            self.db.execute("UPDATE reply_attempts SET status='failed', error=%s WHERE id=%s", (str(exc), attempt_id))
-            self.db.execute("UPDATE messages SET status='failed', error=%s WHERE id=%s", (str(exc), message_id))
+            self.repos.conversations.update_row("reply_attempts", attempt_id, {"status": "failed", "error": str(exc)})
+            self.repos.conversations.update_message(message_id, {"status": "failed", "error": str(exc)})
             self.runtime_logger.log(
                 "ERROR",
                 __name__,
@@ -3308,14 +2998,8 @@ class ShopRunner:
             raise
 
         self._persist_login_cache_after_send()
-        self.db.execute(
-            "UPDATE reply_attempts SET status='success', result_json=%s, content=%s WHERE id=%s",
-            (json_dumps(result), image_url, attempt_id),
-        )
-        self.db.execute(
-            "UPDATE messages SET status='sent', content=%s, raw_json=%s WHERE id=%s",
-            (image_url, json_dumps(result), message_id),
-        )
+        self.repos.conversations.update_row("reply_attempts", attempt_id, {"status": "success", "result_json": json_dumps(result), "content": image_url})
+        self.repos.conversations.update_message(message_id, {"status": "sent", "content": image_url, "raw_json": json_dumps(result)})
         self.hub.publish({"type": "reply_result", "data": {"id": attempt_id, "shop_id": self.shop_id, "status": "success", "result": result}})
         self.hub.publish({"type": "message", "data": self._message_row(message_id)})
         return result
@@ -3334,10 +3018,7 @@ class ShopRunner:
 
     def _chat_type_id_for_send(self, conversation: dict[str, Any], source_message_id: int | None) -> Any:
         if source_message_id:
-            source = self.db.query_one(
-                "SELECT raw_json FROM messages WHERE id=%s AND shop_id=%s",
-                (source_message_id, self.shop_id),
-            )
+            source = self.repos.conversations.message_raw_json(source_message_id, self.shop_id)
             try:
                 raw = json.loads((source or {}).get("raw_json") or "{}")
             except (TypeError, ValueError):
@@ -3349,10 +3030,7 @@ class ShopRunner:
     def _message_fields_for_send(self, conversation: dict[str, Any], source_message_id: int | None) -> dict[str, Any] | None:
         if not source_message_id:
             return None
-        source = self.db.query_one(
-            "SELECT raw_json FROM messages WHERE id=%s AND shop_id=%s",
-            (source_message_id, self.shop_id),
-        )
+        source = self.repos.conversations.message_raw_json(source_message_id, self.shop_id)
         try:
             raw = json.loads((source or {}).get("raw_json") or "{}")
         except (TypeError, ValueError):
@@ -3395,25 +3073,17 @@ class ShopRunner:
         if self._is_conversation_transferred(conversation_id):
             raise RuntimeError("会话已转接，无法发送消息，请等待用户回复后重试")
         content = clean_reply_text(content)
-        conversation = self.db.query_one("SELECT * FROM conversations WHERE id=%s", (conversation_id,))
+        conversation = self.repos.conversations.by_id_plain(conversation_id)
         if not conversation:
             raise ValueError(f"conversation not found: {conversation_id}")
         user_uid = str(conversation["user_uid"])
-        attempt_id = self.db.execute(
-            """
-            INSERT INTO reply_attempts
-            (shop_id, conversation_id, message_id, user_uid, content, status)
-            VALUES (%s,%s,%s,%s,%s,'sending')
-            """,
-            (self.shop_id, conversation_id, source_message_id, user_uid, content),
+        attempt_id = self.repos.conversations.insert_reply_attempt(
+            shop_id=self.shop_id, conversation_id=conversation_id, message_id=source_message_id,
+            user_uid=user_uid, content=content,
         )
-        message_id = self.db.execute(
-            """
-            INSERT INTO messages
-            (shop_id, conversation_id, direction, user_uid, sender_role, kind, content, status)
-            VALUES (%s,%s,'outbound',%s,'service','text',%s,'sending')
-            """,
-            (self.shop_id, conversation_id, user_uid, content),
+        message_id = self.repos.conversations.insert_outbound_message(
+            shop_id=self.shop_id, conversation_id=conversation_id,
+            user_uid=user_uid, kind="text", content=content,
         )
         self.hub.publish({"type": "message", "data": self._message_row(message_id)})
         max_attempts = max(1, int(send_attempts or 1))
@@ -3468,7 +3138,7 @@ class ShopRunner:
                         last_error = reconnect_exc
                         result = None
                         break
-                    conversation = self.db.query_one("SELECT * FROM conversations WHERE id=%s", (conversation_id,))
+                    conversation = self.repos.conversations.by_id_plain(conversation_id)
                     if not conversation:
                         last_error = ValueError(f"conversation not found: {conversation_id}")
                         result = None
@@ -3502,8 +3172,8 @@ class ShopRunner:
 
         if result is None:
             exc = last_error or RuntimeError("send_message failed")
-            self.db.execute("UPDATE reply_attempts SET status='failed', error=%s WHERE id=%s", (str(exc), attempt_id))
-            self.db.execute("UPDATE messages SET status='failed', error=%s WHERE id=%s", (str(exc), message_id))
+            self.repos.conversations.update_row("reply_attempts", attempt_id, {"status": "failed", "error": str(exc)})
+            self.repos.conversations.update_message(message_id, {"status": "failed", "error": str(exc)})
             self.runtime_logger.log(
                 "ERROR",
                 __name__,
@@ -3525,115 +3195,36 @@ class ShopRunner:
         if isinstance(result, dict):
             result = dict(result)
             result["_send_attempts"] = sent_attempt
-        self.db.execute(
-            "UPDATE reply_attempts SET status='success', result_json=%s WHERE id=%s",
-            (json_dumps(result), attempt_id),
-        )
-        self.db.execute(
-            "UPDATE messages SET status='sent', raw_json=%s WHERE id=%s",
-            (json_dumps(result), message_id),
-        )
+        self.repos.conversations.update_row("reply_attempts", attempt_id, {"status": "success", "result_json": json_dumps(result)})
+        self.repos.conversations.update_message(message_id, {"status": "sent", "raw_json": json_dumps(result)})
         self.hub.publish({"type": "reply_result", "data": {"id": attempt_id, "shop_id": self.shop_id, "status": "success", "result": result}})
         self.hub.publish({"type": "message", "data": self._message_row(message_id)})
         return result
 
     def _shop_creator_id(self) -> int | None:
-        shop = self.db.query_one("SELECT created_by_user_id, created_by FROM shops WHERE id=%s", (self.shop_id,))
+        shop = self.repos.shops.get_creator(self.shop_id)
         if not shop:
             return None
         creator = shop.get("created_by_user_id")
         if creator:
             return int(creator)
-        assignments = self.db.query("SELECT user_id FROM shop_assignments WHERE shop_id=%s ORDER BY id LIMIT 2", (self.shop_id,))
+        assignments = self.repos.shops.assignment_candidates(self.shop_id)
         if len(assignments) == 1:
             return int(assignments[0]["user_id"])
         creator = shop.get("created_by")
         return int(creator) if creator else None
 
-    def _require_creator_llm_quota(self, error_message: str) -> int | None:
-        creator = self._shop_creator_id()
-        if not creator:
-            raise RuntimeError("无法确认店铺额度归属，禁止操作店铺")
-        user_row = self.db.query_one("SELECT role, max_llm_replies, llm_reply_count FROM users WHERE id=%s", (creator,))
-        if not user_row:
-            raise RuntimeError("店铺额度归属用户不存在，禁止操作店铺")
-        # 管理员不受额度限制
-        if str(user_row.get("role") or "") == "admin":
-            return creator
-        max_replies = int(user_row.get("max_llm_replies") or 0)
-        used = int(user_row.get("llm_reply_count") or 0)
-        if used >= max_replies:
-            self._quota_exceeded(creator)
-            raise RuntimeError(error_message)
-        return creator
-
-    def _reserve_creator_llm_quota(self, error_message: str) -> tuple[int | None, bool]:
-        creator = self._shop_creator_id()
-        if not creator:
-            raise RuntimeError("无法确认店铺额度归属，禁止调用大模型")
-        user_row = self.db.query_one("SELECT role, max_llm_replies, llm_reply_count FROM users WHERE id=%s", (creator,))
-        if not user_row:
-            raise RuntimeError("店铺额度归属用户不存在，禁止调用大模型")
-        if str(user_row.get("role") or "") == "admin":
-            # 管理员不受额度限制：只计数不拦截
-            self.db.execute("UPDATE users SET llm_reply_count = llm_reply_count + 1 WHERE id=%s", (creator,))
-            return creator, False
-        affected = self.db.execute(
-            """
-            UPDATE users
-            SET llm_reply_count = llm_reply_count + 1
-            WHERE id=%s AND llm_reply_count < max_llm_replies
-            """,
-            (creator,),
-        )
-        if affected < 1:
-            self._quota_exceeded(creator)
-            raise RuntimeError(error_message)
-        max_replies = int(user_row.get("max_llm_replies") or 0)
-        used = int(user_row.get("llm_reply_count") or 0) + 1
-        return creator, used >= max_replies
-
-    def _quota_exceeded(self, user_id: int) -> None:
-        shops = self.db.query(
-            """
-            SELECT DISTINCT s.id
-            FROM shops s
-            LEFT JOIN shop_assignments sa ON sa.shop_id=s.id
-            WHERE (s.created_by_user_id=%s OR sa.user_id=%s OR s.created_by=%s)
-              AND s.status IN ('online','connecting','logged_in','login_success','qr_scanned','login_pending','qr_pending')
-            """,
-            (user_id, user_id, user_id),
-        )
-        for s in shops:
-            shop_id = s["id"]
-            if shop_id == self.shop_id:
-                continue
-            try:
-                if self.manager:
-                    self.manager.offline_shop(shop_id)
-            except Exception:
-                pass
-
-        self._disconnect_customer_service(update_session=True)
-        self._set_shop_status("offline")
-        self.hub.publish({"type": "llm_quota_exceeded", "data": {"user_id": user_id}})
-        self.hub.publish({"type": "shop_status", "data": self._shop_row()})
-
     def transfer(self, *, conversation_id: int, csid: str, remark: str):
         if not self.transfer_client:
             raise RuntimeError("shop is not online")
         self._load_sendable_conversation(conversation_id)
-        conversation = self.db.query_one("SELECT * FROM conversations WHERE id=%s", (conversation_id,))
+        conversation = self.repos.conversations.by_id_plain(conversation_id)
         if not conversation:
             raise ValueError(f"conversation not found: {conversation_id}")
         user_uid = str(conversation["user_uid"])
-        attempt_id = self.db.execute(
-            """
-            INSERT INTO transfer_attempts
-            (shop_id, conversation_id, user_uid, csid, remark, status)
-            VALUES (%s,%s,%s,%s,%s,'sending')
-            """,
-            (self.shop_id, conversation_id, user_uid, csid, remark or ""),
+        attempt_id = self.repos.conversations.insert_transfer_attempt(
+            shop_id=self.shop_id, conversation_id=conversation_id,
+            user_uid=user_uid, csid=csid, remark=remark or "",
         )
         try:
             result = self.transfer_client.move_conversation(
@@ -3642,7 +3233,7 @@ class ShopRunner:
                 remark=remark,
             )
         except Exception as exc:
-            self.db.execute("UPDATE transfer_attempts SET status='failed', error=%s WHERE id=%s", (str(exc), attempt_id))
+            self.repos.conversations.update_row("transfer_attempts", attempt_id, {"status": "failed", "error": str(exc)})
             self.runtime_logger.log(
                 "ERROR",
                 __name__,
@@ -3658,10 +3249,7 @@ class ShopRunner:
             self.hub.publish({"type": "transfer_result", "data": {"id": attempt_id, "shop_id": self.shop_id, "status": "failed", "error": str(exc), "conversation_id": conversation_id}})
             raise
 
-        self.db.execute(
-            "UPDATE transfer_attempts SET status='success', result_json=%s WHERE id=%s",
-            (json_dumps(result), attempt_id),
-        )
+        self.repos.conversations.update_row("transfer_attempts", attempt_id, {"status": "success", "result_json": json_dumps(result)})
 
         close_result = None
         try:
@@ -3689,28 +3277,8 @@ class ShopRunner:
                 error=close_exc,
             )
 
-        self.db.execute(
-            """
-            UPDATE conversations
-            SET transferred_at=NOW(),
-                bot_reply_enabled=0,
-                human_attention_required=0,
-                human_attention_reason=NULL,
-                human_attention_at=NULL
-            WHERE id=%s
-            """,
-            (conversation_id,),
-        )
-        conversation_row = self.db.query_one(
-            """
-            SELECT c.*, s.name AS shop_name, s.status AS shop_status,
-                   s.auto_reply_enabled AS shop_auto_reply_enabled
-            FROM conversations c
-            JOIN shops s ON s.id=c.shop_id
-            WHERE c.id=%s
-            """,
-            (conversation_id,),
-        )
+        self.repos.conversations.mark_transferred(conversation_id)
+        conversation_row = self.repos.conversations.row(conversation_id)
         if conversation_row:
             self.hub.publish({"type": "conversation", "data": conversation_row})
 
@@ -3880,15 +3448,11 @@ class ShopRunner:
         # last_error 必须保存真实错误全文（截断防超长），
         # 否则前端只能看到"登录失败，请重试"而无法获知具体原因
         # （如：店铺身份已被其他店铺占用、登录态需验证等）。
-        self.db.execute(
-            "UPDATE shops SET status='error', last_error=%s WHERE id=%s",
-            (error_msg[:500] if error_msg else "登录失败，请重试", self.shop_id),
+        self.repos.shops.set_status_with_error(
+            self.shop_id, "error", error_msg[:500] if error_msg else "登录失败，请重试",
         )
         if self.session_id:
-            self.db.execute(
-                "UPDATE shop_sessions SET status='error', ended_at=NOW(), error=%s WHERE id=%s",
-                (error_msg, self.session_id),
-            )
+            self.repos.shops.end_session_with_error(self.session_id, error_msg)
         self.runtime_logger.log(
             "ERROR",
             __name__,
@@ -3901,32 +3465,16 @@ class ShopRunner:
         self.hub.publish({"type": "shop_status", "data": self._shop_row()})
 
     def _set_shop_status(self, status: str) -> None:
-        self.db.execute("UPDATE shops SET status=%s WHERE id=%s", (status, self.shop_id))
+        self.repos.shops.set_status(self.shop_id, status)
 
     def _invalidate_login_cache(self) -> None:
-        self.db.execute("DELETE FROM shop_login_caches WHERE shop_id=%s", (self.shop_id,))
+        self.repos.shops.delete_login_cache(self.shop_id)
 
     def _shop_row(self):
-        return self.db.query_one(
-            """
-            SELECT s.*, EXISTS(SELECT 1 FROM shop_login_caches c WHERE c.shop_id=s.id) AS has_login_cache
-            FROM shops s
-            WHERE s.id=%s
-            """,
-            (self.shop_id,),
-        )
+        return self.repos.shops.row_with_cache(self.shop_id)
 
     def _message_row(self, message_id: int):
-        return self.db.query_one("SELECT * FROM messages WHERE id=%s", (message_id,))
+        return self.repos.conversations.row_by_id("messages", message_id)
 
     def _conversation_row(self, conversation_id: int):
-        return self.db.query_one(
-            """
-            SELECT c.*, s.name AS shop_name, s.status AS shop_status,
-                   s.auto_reply_enabled AS shop_auto_reply_enabled
-            FROM conversations c
-            JOIN shops s ON s.id=c.shop_id
-            WHERE c.id=%s
-            """,
-            (conversation_id,),
-        )
+        return self.repos.conversations.row(conversation_id)

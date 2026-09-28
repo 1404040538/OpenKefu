@@ -91,16 +91,6 @@ class StorageConfig:
 
 
 @dataclass(frozen=True)
-class ServerStatusConfig:
-    enabled: bool
-    collect_interval_seconds: int
-    persist_interval_seconds: int
-    raw_retention_days: int
-    rollup_retention_days: int
-    top_process_limit: int
-
-
-@dataclass(frozen=True)
 class AppConfig:
     server: ServerConfig
     mysql: MySQLConfig
@@ -112,7 +102,6 @@ class AppConfig:
     embedding: EmbeddingConfig
     vector_store: VectorStoreConfig
     storage: StorageConfig
-    server_status: ServerStatusConfig
 
 
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
@@ -215,7 +204,6 @@ def load_config(path: Path | None = None) -> AppConfig:
     embedding = _optional_section(data, "embedding")
     vector_store = _optional_section(data, "vector_store")
     storage = _optional_section(data, "storage")
-    server_status = _optional_section(data, "server_status")
 
     llm_api_key = str(llm.get("api_key") or os.getenv("OPENKEFU_LLM_API_KEY") or "")
     llm_base_url = str(llm.get("base_url") or os.getenv("OPENKEFU_LLM_BASE_URL") or "https://api.deepseek.com")
@@ -342,13 +330,5 @@ def load_config(path: Path | None = None) -> AppConfig:
         ),
         storage=StorageConfig(
             knowledge_dir=str(storage.get("knowledge_dir") or "data/knowledge_files"),
-        ),
-        server_status=ServerStatusConfig(
-            enabled=_bool(server_status.get("enabled"), True),
-            collect_interval_seconds=max(2, int(server_status.get("collect_interval_seconds") or 5)),
-            persist_interval_seconds=max(10, int(server_status.get("persist_interval_seconds") or 30)),
-            raw_retention_days=max(1, int(server_status.get("raw_retention_days") or 7)),
-            rollup_retention_days=max(1, int(server_status.get("rollup_retention_days") or 30)),
-            top_process_limit=max(1, int(server_status.get("top_process_limit") or 8)),
         ),
     )

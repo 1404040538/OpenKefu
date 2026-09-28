@@ -27,7 +27,6 @@ jobs:
         run: |
           python checks/intent_prompt_unit.py
           python checks/security_unit.py
-          python checks/server_status_unit.py
           python checks/return_records_unit.py
           python checks/reply_cache_unit.py
           python checks/chat_transport_unit.py
