@@ -12,9 +12,11 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from typing import Any, Callable
 
 import requests
+from pymysql.err import IntegrityError
 
 from openkefu.platforms.qianniu.auth.login import Login
 from openkefu.platforms.qianniu.chat.impaas_client import ImpaasClient, ImpaasClientConfig
@@ -72,6 +74,34 @@ class QianniuShopRunner:
 
     def password_login_shop(self, username: str, password: str, verify_code: str = "") -> dict[str, Any]:
         raise RuntimeError("千牛平台暂仅支持扫码登录")
+
+    def _complete_password_login(self, verify_code: str) -> dict[str, Any]:
+        raise RuntimeError("千牛平台暂仅支持扫码登录")
+
+    # ---------- manager 兼容方法（worker 启动恢复 / 每日重连任务调用） ----------
+
+    def _connect_customer_service_from_cache(self) -> None:
+        """对齐 PDD ShopRunner 约定：从登录缓存恢复客服连接。"""
+        self._connect_from_cache()
+
+    def _disconnect_customer_service(self, *, update_session: bool, session_status: str = "offline",
+                                     cancel_reconnect: bool = True) -> None:
+        self._disconnect(update_session=update_session, session_status=session_status)
+
+    def hot_reconnect_customer_service(self, *, reason: str = "scheduled") -> bool:
+        """每日定时热重连：重建 impaas 连接（重铸 token）。"""
+        try:
+            with self.lock:
+                if self.im_client:
+                    self.im_client.stop()
+                    self.im_client = None
+            self._connect_from_cache()
+            return True
+        except Exception as exc:
+            logger.exception("qianniu hot reconnect failed: %s", reason)
+            self.runtime_logger.log("WARNING", __name__, "qianniu.reconnect",
+                                    f"hot reconnect failed: {exc}", shop_id=self.shop_id)
+            return False
 
     def online(self) -> dict[str, Any]:
         row = self._shop_row()
@@ -202,8 +232,11 @@ class QianniuShopRunner:
 
     def _on_messages(self, messages: list[ImpaasMessage]) -> None:
         for message in messages:
+            # 入库（幂等：msg_id 唯一）
+            conversation_id = self._store_message(message)
             self.hub.publish({"type": "qianniu_message", "data": {
                 "shop_id": self.shop_id,
+                "conversation_id": conversation_id,
                 "cid": message.cid,
                 "sender_uid": message.sender_uid_num,
                 "text": message.text,
@@ -213,24 +246,122 @@ class QianniuShopRunner:
             }})
         self.runtime_logger.log("INFO", __name__, "qianniu.message", "messages received",
                                 shop_id=self.shop_id, count=len(messages))
-        if self.reply_fn and self.im_client:
-            for message in messages:
-                try:
-                    reply = self.reply_fn(message, self)
-                except Exception:
-                    logger.exception("qianniu reply_fn failed")
-                    continue
-                if not reply:
-                    continue
-                try:
-                    peer = self._peer_uid(message.cid)
-                    if peer:
-                        self.im_client.send_text(message.cid, peer, reply)
-                        self.runtime_logger.log("INFO", __name__, "qianniu.reply",
-                                                 "auto reply sent", shop_id=self.shop_id,
-                                                 cid=message.cid, length=len(reply))
-                except Exception:
-                    logger.exception("qianniu send reply failed")
+        # 卡片消息（contentType 101）是浏览上下文，不触发自动回复
+        text_messages = [m for m in messages if m.content_type == 1]
+        if not (self.reply_fn and text_messages and self._auto_reply_enabled() and self.im_client):
+            return
+        for message in text_messages:
+            try:
+                reply = self.reply_fn(message, self)
+            except Exception:
+                logger.exception("qianniu reply_fn failed")
+                continue
+            if not reply:
+                continue
+            peer = self._peer_uid(message.cid)
+            if not peer:
+                continue
+            try:
+                result = self.im_client.send_text(message.cid, peer, reply)
+                self._store_outbound_message(message, str(result.get("messageId") or ""), reply)
+                self.runtime_logger.log("INFO", __name__, "qianniu.reply",
+                                         "auto reply sent", shop_id=self.shop_id,
+                                         cid=message.cid, length=len(reply))
+            except Exception:
+                logger.exception("qianniu send reply failed")
+
+    def _auto_reply_enabled(self) -> bool:
+        state = self.repos.shops.auto_reply_state(self.shop_id)
+        return bool(state and state.get("auto_reply_enabled"))
+
+    # ---------- 消息持久化（沿用 conversations/messages 表约定） ----------
+
+    def _store_message(self, message: ImpaasMessage) -> int:
+        """买家消息入库（幂等），返回 conversation_id。"""
+        try:
+            existing = self.repos.conversations.existing_message_row(
+                self.shop_id, msg_id=message.message_id or None)
+            if existing:
+                return int(existing.get("conversation_id") or 0)
+        except Exception:
+            logger.exception("qianniu existing_message_row failed")
+
+        user_uid = self._peer_uid(message.cid) or message.sender_uid_num
+        is_card = message.content_type != 1
+        mall_id = self.mall_id or None
+        params = {
+            "shop_id": self.shop_id,
+            "mall_id": mall_id,
+            "conv_id": message.cid,
+            "chat_type_id": "",
+            "chat_type": "qianniu_kefu",
+            "user_uid": user_uid,
+            "nickname": "",
+            "preview": (message.text or "")[:512],
+            "message_at": message.create_at or int(time.time() * 1000),
+            "unread_delta": 0 if is_card else 1,
+        }
+        try:
+            conversation = self.repos.conversations.by_shop_uid_mall(self.shop_id, user_uid, mall_id)
+            if conversation:
+                conversation_id = int(conversation["id"])
+                self.repos.conversations.touch_on_message(conversation_id, params)
+            else:
+                conversation_id = self.repos.conversations.create_from_incoming(params)
+        except IntegrityError:
+            conversation = self.repos.conversations.by_shop_uid_mall(self.shop_id, user_uid, mall_id)
+            if not conversation:
+                raise
+            conversation_id = int(conversation["id"])
+
+        try:
+            self.repos.conversations.insert_chat_message({
+                "shop_id": self.shop_id,
+                "conversation_id": conversation_id,
+                "direction": "system" if is_card else "inbound",
+                "msg_id": message.message_id,
+                "client_msg_id": "",
+                "user_uid": user_uid,
+                "sender_role": "system" if is_card else "user",
+                "message_type": message.content_type,
+                "kind": "card" if is_card else "text",
+                "content": message.text or "",
+                "goods_json": None,
+                "size_json": None,
+                "raw_json": json_dumps({"cid": message.cid, "sender": message.sender_uid,
+                                        "contentType": message.content_type,
+                                        "createAt": message.create_at}),
+                "message_at": message.create_at or int(time.time() * 1000),
+            })
+        except IntegrityError:
+            pass  # 并发重复推送，幂等
+        return conversation_id
+
+    def _store_outbound_message(self, source: ImpaasMessage, msg_id: str, content: str) -> None:
+        """自动回复入库（direction=outbound，对齐人工回复约定）。"""
+        try:
+            conversation = self.repos.conversations.by_shop_uid_mall(
+                self.shop_id, self._peer_uid(source.cid) or "", self.mall_id or None)
+            if not conversation:
+                return
+            self.repos.conversations.insert_chat_message({
+                "shop_id": self.shop_id,
+                "conversation_id": int(conversation["id"]),
+                "direction": "outbound",
+                "msg_id": msg_id,
+                "client_msg_id": "",
+                "user_uid": source.sender_uid_num,
+                "sender_role": "service",
+                "message_type": 1,
+                "kind": "text",
+                "content": content,
+                "goods_json": None,
+                "size_json": None,
+                "raw_json": None,
+                "message_at": int(time.time() * 1000),
+            })
+        except Exception:
+            logger.exception("qianniu store outbound failed")
 
     def _peer_uid(self, cid: str) -> str | None:
         head = cid.split("#", 1)[0]

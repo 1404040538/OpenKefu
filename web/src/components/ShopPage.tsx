@@ -32,6 +32,7 @@ export function ShopPage({
 }) {
   const [name, setName] = useState("");
   const [remark, setRemark] = useState("");
+  const [platform, setPlatform] = useState("pdd");
   const [showCreate, setShowCreate] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Shop | null>(null);
   const { isPending, runAction } = usePendingActions();
@@ -56,6 +57,7 @@ export function ShopPage({
             <div className="shop-card-header">
               <div className="shop-card-title">
                 <strong>{shop.name}</strong>
+                {shop.platform === "qianniu" && <span className="shop-card-mall" title="千牛平台">千牛</span>}
                 <span className="shop-card-mall">{shop.nickname || shop.mall_id || "未绑定店铺信息"}</span>
               </div>
               <div className="shop-card-header-actions">
@@ -78,9 +80,11 @@ export function ShopPage({
                 {isPending(`shop-login-${shop.id}`) ? <Loader2 className="spin" size={14} /> : <Play size={14} />}
                 {isPending(`shop-login-${shop.id}`) ? "登录中" : shop.has_login_cache || LOGIN_FINISHED_STATUSES.has(shop.status) ? "重新扫码" : "扫码登录"}
               </button>
-              <button className="btn btn-sm" onClick={(e) => { e.stopPropagation(); onPasswordLogin(shop.id); }}>
-                <Play size={14} /> 账密登录
-              </button>
+              {shop.platform !== "qianniu" && (
+                <button className="btn btn-sm" onClick={(e) => { e.stopPropagation(); onPasswordLogin(shop.id); }}>
+                  <Play size={14} /> 账密登录
+                </button>
+              )}
               {shop.status === "online" ? (
                 <button className="btn btn-sm" disabled={isPending(`shop-offline-${shop.id}`)} onClick={(e) => {
                   e.stopPropagation();
@@ -119,7 +123,7 @@ export function ShopPage({
           <form className="modal modal-sm" onClick={(e) => e.stopPropagation()} onSubmit={async (e) => {
             e.preventDefault();
             await runAction("shop-create", async () => {
-              const body: any = { name, remark, auto_reply_enabled: true };
+              const body: any = { name, platform, remark, auto_reply_enabled: true };
               await onCreate(body);
               setName("");
               setRemark("");
@@ -134,6 +138,12 @@ export function ShopPage({
               <button className="btn btn-ghost" type="button" disabled={createPending} onClick={() => setShowCreate(false)}>关闭</button>
             </div>
             <div className="modal-body">
+              <div className="form-group">
+                <select className="input" disabled={createPending} value={platform} onChange={(e) => setPlatform(e.target.value)}>
+                  <option value="pdd">拼多多（mms 客服）</option>
+                  <option value="qianniu">千牛（淘宝商家客服）</option>
+                </select>
+              </div>
               <div className="form-group">
                 <input className="input" disabled={createPending} value={name} onChange={(e) => setName(e.target.value)} placeholder="店铺名称" autoFocus />
               </div>

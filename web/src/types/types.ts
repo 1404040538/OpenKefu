@@ -10,6 +10,7 @@ export type User = {
 export type Shop = {
   id: number;
   name: string;
+  platform?: string;
   remark: string;
   mall_id?: string;
   nickname?: string;

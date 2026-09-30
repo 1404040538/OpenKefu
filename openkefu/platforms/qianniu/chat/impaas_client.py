@@ -218,20 +218,32 @@ class ImpaasClient:
                 "sync": "0,0;0;0;", "did": self._device_id,
                 "mid": self._next_mid(),
             }})
-            last_heartbeat = time.time()
-            while not self._stop.is_set():
-                try:
-                    raw = ws.recv()
-                except websocket.WebSocketTimeoutException:
-                    raw = None
-                now = time.time()
-                if now - last_heartbeat >= self.config.heartbeat_interval:
-                    self._send_frame({"lwp": "/!", "headers": {"mid": self._next_mid()}})
-                    last_heartbeat = now
-                if raw:
-                    self._handle_frame(raw, reg_mid)
-                    if self.status != "online" and self.my_uid:
-                        self._set_status("online", self.my_uid)
+            # 独立心跳线程：服务端要求 /reg 后 ~15s 内收到心跳，迟到即被
+            # /push/kickout 踢线（不能依赖接收循环的 5s 节拍，会输掉竞速）
+            hb_stop = threading.Event()
+
+            def _heartbeat_loop() -> None:
+                while not hb_stop.wait(self.config.heartbeat_interval * 0.8):
+                    if self._stop.is_set():
+                        return
+                    try:
+                        self._send_frame({"lwp": "/!", "headers": {"mid": self._next_mid()}})
+                    except Exception:
+                        return
+
+            threading.Thread(target=_heartbeat_loop, name="impaas-heartbeat", daemon=True).start()
+            try:
+                while not self._stop.is_set():
+                    try:
+                        raw = ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        raw = None
+                    if raw:
+                        self._handle_frame(raw, reg_mid)
+                        if self.status != "online" and self.my_uid:
+                            self._set_status("online", self.my_uid)
+            finally:
+                hb_stop.set()
         finally:
             self._close_socket()
             with self._waiters_lock:
