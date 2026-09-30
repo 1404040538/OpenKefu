@@ -104,6 +104,8 @@ class ShopRuntimeManager:
                     from openkefu.platforms.qianniu.runtime import QianniuShopRunner
                     self._runners[shop_id] = QianniuShopRunner(
                         shop_id, self.db, self.hub, self.runtime_logger, self.config,
+                        llm_client=self.llm_client,
+                        reply_cache=self.reply_cache,
                         manager=self,
                     )
                 else:

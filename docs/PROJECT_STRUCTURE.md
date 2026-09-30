@@ -34,6 +34,20 @@
 
 > 接入新平台：在 `platforms/` 下新建包，实现登录、消息通道与业务接口，复用 `openkefu/web/` 通用层。
 
+### 3.1.5 `services/` — 平台无关共享服务层（`[入库]`）
+
+> 2026-09 千牛接入时从 `platforms/pdd/chat/` 抽取；pdd 侧同名模块保留为兼容 re-export shim。
+
+| 模块 | 功能 |
+|---|---|
+| `services/llm.py` | LLMClient：统一 LLM 调用（OpenAI 兼容协议） |
+| `services/knowledge.py` | KnowledgeService/NoteSetService：知识库检索与店铺笔记 |
+| `services/llm_reply.py` | analyze_customer_intent：意图分析 + 回复生成 |
+| `services/conversation.py` | build_conversation_messages：历史压缩/摘要 |
+| `services/intent.py` | 意图提示词构造与结果归一化 |
+| `services/fast_reply.py` | 快捷回复规则匹配 |
+| `services/reply_cache.py` | ReplyCache：向量缓存相似问答 |
+
 ### 3.2 `web/` — 通用后端服务层（平台无关，`[入库]`）
 
 | 模块 | 文件 | 功能 |
