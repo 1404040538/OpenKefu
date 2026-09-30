@@ -27,6 +27,10 @@
 | `platforms/pdd/chat/` | 客服业务：Titan WS 客户端与编解码、客服 HTTP 接口（发消息/会话/商品/转接）、自动回复链路（意图→知识库→LLM→缓存）、订单/退货/快捷回复封装、字体反爬解码 |
 | `platforms/pdd/config.py` | 拼多多平台常量（URL、UA、login_js 路径、PROJECT_ROOT） |
 | `platforms/pdd/common.py` | 拼多多公共工具（cookie 别名、请求封装） |
+| `platforms/qianniu/auth/` | 千牛（淘宝商家）扫码登录：qrlogin JSONP 生成/轮询 + `/newlogin/token/loginByIm.do` 直连换全套 web 会话 cookie（纯协议，无浏览器） |
+| `platforms/qianniu/chat/` | 千牛客服消息：impaas WSS 客户端（token 铸造/心跳/重连/推送增量拉取/收发）、消息与会话模型解析 |
+| `platforms/qianniu/runtime.py` | QianniuShopRunner：扫码登录流程（复用 qr_login_attempts/shop_login_caches 约定）+ IM 常驻 + reply_fn 自动回复钩子 |
+| `platforms/qianniu/config.py`、`common.py` | 千牛平台常量与工具 |
 
 > 接入新平台：在 `platforms/` 下新建包，实现登录、消息通道与业务接口，复用 `openkefu/web/` 通用层。
 

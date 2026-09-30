@@ -47,16 +47,17 @@ class ShopsRepository:
         )
 
     def create(self, *, name: str, remark: str, auto_reply_enabled: bool, transfer_csids: list[str] | None,
-               created_by: int, greeting_message: str | None, greeting_use_llm: bool, force_ai_reply: bool) -> int:
+               created_by: int, greeting_message: str | None, greeting_use_llm: bool, force_ai_reply: bool,
+               platform: str = "pdd") -> int:
         with self.db.connect() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
                     """
-                    INSERT INTO shops (name, remark, auto_reply_enabled, transfer_csids, created_by, created_by_user_id,
+                    INSERT INTO shops (name, platform, remark, auto_reply_enabled, transfer_csids, created_by, created_by_user_id,
                                        greeting_message, greeting_use_llm, force_ai_reply)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """,
-                    (name, remark, int(auto_reply_enabled),
+                    (name, platform, remark, int(auto_reply_enabled),
                      json_dumps(transfer_csids) if transfer_csids else None,
                      created_by, created_by,
                      greeting_message, int(greeting_use_llm), int(force_ai_reply)),

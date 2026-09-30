@@ -19,6 +19,7 @@ from openkefu.web.db import json_dumps
 
 class ShopCreate(BaseModel):
     name: str
+    platform: str = "pdd"
     remark: str = ""
     auto_reply_enabled: bool = True
     transfer_csids: list[str] = []
@@ -99,6 +100,7 @@ def build_router(ctx: AppContext) -> APIRouter:
 
         shop_id = ctx.repos.shops.create(
             name=name,
+            platform=body.platform if body.platform in ("pdd", "qianniu") else "pdd",
             remark=body.remark,
             auto_reply_enabled=body.auto_reply_enabled,
             transfer_csids=body.transfer_csids,
