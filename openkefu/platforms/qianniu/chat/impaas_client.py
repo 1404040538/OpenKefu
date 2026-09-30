@@ -151,6 +151,8 @@ class ImpaasClient:
         self._waiters: dict[str, tuple[threading.Event, dict]] = {}
         self._waiters_lock = threading.Lock()
         self._seen_message_ids: dict[str, float] = {}
+        self._baselined_cids: set[str] = set()
+        self._connected_at = int(time.time() * 1000)
         self._device_id = new_device_id()
         self._access_token = ""
         # 推送处理线程池：避免在收帧线程内同步等 RPC 响应（会自锁）
@@ -273,6 +275,7 @@ class ImpaasClient:
 
         if headers.get("reg-sid"):
             self.my_uid = str(headers.get("reg-uid", ""))
+            self._connected_at = int(time.time() * 1000)
             self._resolve_waiter(reg_mid, frame)
             # 异步对齐同步游标（响应到达后由 pts 分支 ackDiff）
             try:
@@ -293,9 +296,16 @@ class ImpaasClient:
             if mid:
                 self._resolve_waiter(mid, frame)
             return
-        # 推送（无 code）
+        # 推送（无 code，带 mid = 服务端发起的 LWP 请求，必须应答，
+        # 否则后续发送新请求会被服务端断连——SDK 的 pushHandler 返回
+        # {code:200, headers:{}, body:{}} 即此应答）
         uri = frame.get("lwp", "")
-        if uri in ("/s/sync", "/s/para"):
+        if uri in ("/s/sync", "/s/para", "/s/session/remove"):
+            if mid:
+                try:
+                    self._send_frame({"headers": {"mid": mid}, "code": 200, "body": {}})
+                except Exception:
+                    logger.exception("push ack failed")
             self._handle_push(frame)
 
     def _handle_push(self, frame: dict) -> None:
@@ -328,8 +338,9 @@ class ImpaasClient:
     def _fetch_new_messages(self, cid: str) -> None:
         """增量拉取会话新消息并回调。"""
         try:
+            cursor = int(time.time() * 1000) + 60000
             response = self.rpc("/r/MessageManager/listUserMessages",
-                                [cid, True, 0, self.config.history_fetch_count, True])
+                                [cid, False, cursor, self.config.history_fetch_count, True])
         except Exception:
             logger.exception("listUserMessages failed cid=%s", cid)
             return
@@ -337,7 +348,9 @@ class ImpaasClient:
         models = body.get("userMessageModels") if isinstance(body, dict) else None
         if not models:
             return
+        self._baselined_cids.add(cid)
         now = time.time()
+        first_fetch = cid not in self._baselined_cids
         fresh: list[ImpaasMessage] = []
         for model in models:
             message = parse_message(model)
@@ -346,9 +359,14 @@ class ImpaasClient:
             if message.message_id in self._seen_message_ids:
                 continue
             self._seen_message_ids[message.message_id] = now
+            if first_fetch:
+                continue  # 首次拉取只做基线，不回放历史消息
             if self.my_uid and message.sender_uid == self.my_uid:
                 continue  # 自己发的
             if message.content_type in (0,):
+                continue
+            # 兜底：跳过早于连接建立的消息（时钟/乱序保护）
+            if message.create_at and message.create_at < self._connected_at - 60_000:
                 continue
             fresh.append(message)
         # 清理过期去重键（保留 1 小时）
@@ -426,7 +444,14 @@ class ImpaasClient:
         return convs
 
     def list_messages(self, cid: str, *, count: int = 20) -> list[ImpaasMessage]:
-        response = self.rpc("/r/MessageManager/listUserMessages", [cid, True, 0, count, True])
+        """拉取会话最新消息（时间倒序）。
+
+        listUserMessages 的 cursor 是 createdAt 毫秒值：
+        forward=False + cursor=<now> → 从最新往回取 N 条（本方法用法）；
+        forward=True + cursor=0 会从最旧向后取（勿用）。
+        """
+        cursor = int(time.time() * 1000) + 60000
+        response = self.rpc("/r/MessageManager/listUserMessages", [cid, False, cursor, count, True])
         body = response.get("body") or {}
         messages = []
         for model in (body.get("userMessageModels") or []):
