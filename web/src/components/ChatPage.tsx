@@ -152,14 +152,16 @@ export function ChatPage({ shops, activeShop, shopFilter, conversations, selecte
             }).catch(() => undefined);
           }}>
             <input className="input" disabled={!canSend || replyPending || imageReplyPending} value={text} onChange={(e) => setText(e.target.value)} placeholder={sendPlaceholder} />
-            <label className={`btn btn-ghost btn-icon chat-image-send ${!canSend || replyPending || imageReplyPending ? "disabled" : ""}`} title={imageReplyPending ? "图片发送中" : "发送图片"}>
-              {imageReplyPending ? <Loader2 className="spin" size={16} /> : <ImageIcon size={16} />}
-              <input type="file" accept="image/*" disabled={!canSend || replyPending || imageReplyPending} onChange={(event) => {
-                const file = event.target.files?.[0];
-                event.currentTarget.value = "";
-                handleImageFile(file).catch((error) => alert(String(error)));
-              }} />
-            </label>
+            {selectedShop?.platform !== "qianniu" && (
+              <label className={`btn btn-ghost btn-icon chat-image-send ${!canSend || replyPending || imageReplyPending ? "disabled" : ""}`} title={imageReplyPending ? "图片发送中" : "发送图片"}>
+                {imageReplyPending ? <Loader2 className="spin" size={16} /> : <ImageIcon size={16} />}
+                <input type="file" accept="image/*" disabled={!canSend || replyPending || imageReplyPending} onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  event.currentTarget.value = "";
+                  handleImageFile(file).catch((error) => alert(String(error)));
+                }} />
+              </label>
+            )}
             <button className="btn btn-primary" disabled={!canSend || replyPending || imageReplyPending || !text.trim()}>
               {replyPending ? <Loader2 className="spin" size={16} /> : <Send size={16} />}
               {replyPending ? "发送中" : null}
@@ -179,20 +181,24 @@ export function ChatPage({ shops, activeShop, shopFilter, conversations, selecte
             {selectedConversation?.human_attention_required ? "该顾客需要人工处理，打开后提醒已清除；重新开启前会进入大模型。" : selectedShop ? `当前店铺：${selectedShop.name}` : "选择会话后可切换"}
           </small>
 
-          <h3 className="chat-panel-title"><Workflow size={16} /> 转接客服</h3>
-          <button className="btn btn-ghost btn-full" disabled={!canSend || loadServicesPending} onClick={() => runAction(loadServicesKey, onLoadServices).catch(() => undefined)}>
-            {loadServicesPending ? <Loader2 className="spin" size={16} /> : <RefreshCw size={16} />}
-            {loadServicesPending ? "获取中" : "获取客服列表"}
-          </button>
-          <select className="input" disabled={transferPending} value={csid} onChange={(e) => setCsid(e.target.value)}>
-            <option value="">选择客服</option>
-            {services.map((svc: any) => <option key={svc.csid} value={svc.csid}>{svc.username || svc.nickname || svc.csid}</option>)}
-          </select>
-          <input className="input" disabled={transferPending} value={remark} onChange={(e) => setRemark(e.target.value)} />
-          <button className="btn btn-primary btn-full" disabled={!canSend || !csid || transferPending} onClick={() => csid && runAction(transferKey, () => onTransfer(csid, remark)).catch(() => undefined)}>
-            {transferPending ? <Loader2 className="spin" size={16} /> : null}
-            {transferPending ? "转接中" : "转接当前会话"}
-          </button>
+          {selectedShop?.platform !== "qianniu" && (
+            <>
+              <h3 className="chat-panel-title"><Workflow size={16} /> 转接客服</h3>
+              <button className="btn btn-ghost btn-full" disabled={!canSend || loadServicesPending} onClick={() => runAction(loadServicesKey, onLoadServices).catch(() => undefined)}>
+                {loadServicesPending ? <Loader2 className="spin" size={16} /> : <RefreshCw size={16} />}
+                {loadServicesPending ? "获取中" : "获取客服列表"}
+              </button>
+              <select className="input" disabled={transferPending} value={csid} onChange={(e) => setCsid(e.target.value)}>
+                <option value="">选择客服</option>
+                {services.map((svc: any) => <option key={svc.csid} value={svc.csid}>{svc.username || svc.nickname || svc.csid}</option>)}
+              </select>
+              <input className="input" disabled={transferPending} value={remark} onChange={(e) => setRemark(e.target.value)} />
+              <button className="btn btn-primary btn-full" disabled={!canSend || !csid || transferPending} onClick={() => csid && runAction(transferKey, () => onTransfer(csid, remark)).catch(() => undefined)}>
+                {transferPending ? <Loader2 className="spin" size={16} /> : null}
+                {transferPending ? "转接中" : "转接当前会话"}
+              </button>
+            </>
+          )}
         </section>
       </div>
     </div>

@@ -347,15 +347,17 @@ class Database:
             ("human_attention_required", "ALTER TABLE conversations ADD COLUMN human_attention_required TINYINT(1) NOT NULL DEFAULT 0"),
             ("human_attention_reason", "ALTER TABLE conversations ADD COLUMN human_attention_reason VARCHAR(128) NULL DEFAULT NULL"),
             ("human_attention_at", "ALTER TABLE conversations ADD COLUMN human_attention_at TIMESTAMP NULL DEFAULT NULL"),
+            ("platform", "ALTER TABLE shops ADD COLUMN platform VARCHAR(32) NOT NULL DEFAULT 'pdd' AFTER name"),
         ):
+            table = "shops" if column_name == "platform" else "conversations"
             cursor.execute(
                 "SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS "
-                "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='conversations' AND COLUMN_NAME=%s",
-                (mysql.database, column_name),
+                "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND COLUMN_NAME=%s",
+                (mysql.database, table, column_name),
             )
             if cursor.fetchone()["cnt"] == 0:
                 cursor.execute(column_sql)
-                logger.info("migration: added %s column to conversations", column_name)
+                logger.info("migration: added %s column to %s", column_name, table)
 
         cursor.execute(
             """
@@ -777,7 +779,7 @@ REQUIRED_SCHEMA = {
         "created_at", "updated_at",
     ],
     "shops": [
-        "id", "name", "remark", "mall_id", "status", "auto_reply_enabled",
+        "id", "name", "platform", "remark", "mall_id", "status", "auto_reply_enabled",
         "last_error", "created_by", "created_by_user_id",
         "greeting_message", "closing_message", "greeting_use_llm",
         "closing_use_llm", "force_ai_reply", "transfer_csids", "nickname",
@@ -908,6 +910,7 @@ SCHEMA = [
     CREATE TABLE IF NOT EXISTS shops (
         id BIGINT PRIMARY KEY AUTO_INCREMENT,
         name VARCHAR(128) NOT NULL,
+        platform VARCHAR(32) NOT NULL DEFAULT 'pdd',
         remark VARCHAR(512) NOT NULL DEFAULT '',
         mall_id VARCHAR(64) NULL,
         status VARCHAR(32) NOT NULL DEFAULT 'idle',

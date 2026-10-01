@@ -27,8 +27,26 @@
 | `platforms/pdd/chat/` | 客服业务：Titan WS 客户端与编解码、客服 HTTP 接口（发消息/会话/商品/转接）、自动回复链路（意图→知识库→LLM→缓存）、订单/退货/快捷回复封装、字体反爬解码 |
 | `platforms/pdd/config.py` | 拼多多平台常量（URL、UA、login_js 路径、PROJECT_ROOT） |
 | `platforms/pdd/common.py` | 拼多多公共工具（cookie 别名、请求封装） |
+| `platforms/qianniu/auth/` | 千牛（淘宝商家）扫码登录：qrlogin JSONP 生成/轮询 + `/newlogin/token/loginByIm.do` 直连换全套 web 会话 cookie（纯协议，无浏览器） |
+| `platforms/qianniu/chat/` | 千牛客服消息：impaas WSS 客户端（token 铸造/心跳/重连/推送增量拉取/收发）、消息与会话模型解析 |
+| `platforms/qianniu/runtime.py` | QianniuShopRunner：扫码登录流程（复用 qr_login_attempts/shop_login_caches 约定）+ IM 常驻 + reply_fn 自动回复钩子 |
+| `platforms/qianniu/config.py`、`common.py` | 千牛平台常量与工具 |
 
 > 接入新平台：在 `platforms/` 下新建包，实现登录、消息通道与业务接口，复用 `openkefu/web/` 通用层。
+
+### 3.1.5 `services/` — 平台无关共享服务层（`[入库]`）
+
+> 2026-09 千牛接入时从 `platforms/pdd/chat/` 抽取；pdd 侧同名模块保留为兼容 re-export shim。
+
+| 模块 | 功能 |
+|---|---|
+| `services/llm.py` | LLMClient：统一 LLM 调用（OpenAI 兼容协议） |
+| `services/knowledge.py` | KnowledgeService/NoteSetService：知识库检索与店铺笔记 |
+| `services/llm_reply.py` | analyze_customer_intent：意图分析 + 回复生成 |
+| `services/conversation.py` | build_conversation_messages：历史压缩/摘要 |
+| `services/intent.py` | 意图提示词构造与结果归一化 |
+| `services/fast_reply.py` | 快捷回复规则匹配 |
+| `services/reply_cache.py` | ReplyCache：向量缓存相似问答 |
 
 ### 3.2 `web/` — 通用后端服务层（平台无关，`[入库]`）
 

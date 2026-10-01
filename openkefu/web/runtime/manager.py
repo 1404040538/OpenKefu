@@ -31,7 +31,6 @@ from openkefu.platforms.pdd.chat.goods import GoodsService
 from openkefu.platforms.pdd.chat.intent import clean_reply_text
 from openkefu.platforms.pdd.chat.knowledge import KnowledgeService, NoteSetService
 from openkefu.platforms.pdd.chat.llm import LLMClient, get_llm_client
-from openkefu.platforms.pdd.chat.llm_reply import analyze_customer_intent
 from openkefu.platforms.pdd.chat.orders import OrderService
 from openkefu.platforms.pdd.chat.reply_cache import ReplyCache
 from openkefu.platforms.pdd.chat.return_records import ReturnRecordService
@@ -99,12 +98,23 @@ class ShopRuntimeManager:
         shop_id = int(shop_id)
         with self._lock:
             if shop_id not in self._runners:
-                self._runners[shop_id] = ShopRunner(
-                    shop_id, self.db, self.hub, self.runtime_logger, self.config,
-                    llm_client=self.llm_client,
-                    reply_cache=self.reply_cache,
-                    manager=self,
-                )
+                row = self.db.query_one("SELECT platform FROM shops WHERE id=%s", (shop_id,))
+                platform = (row or {}).get("platform") or "pdd"
+                if platform == "qianniu":
+                    from openkefu.platforms.qianniu.runtime import QianniuShopRunner
+                    self._runners[shop_id] = QianniuShopRunner(
+                        shop_id, self.db, self.hub, self.runtime_logger, self.config,
+                        llm_client=self.llm_client,
+                        reply_cache=self.reply_cache,
+                        manager=self,
+                    )
+                else:
+                    self._runners[shop_id] = ShopRunner(
+                        shop_id, self.db, self.hub, self.runtime_logger, self.config,
+                        llm_client=self.llm_client,
+                        reply_cache=self.reply_cache,
+                        manager=self,
+                    )
             return self._runners[shop_id]
 
     def start_shop(self, shop_id: int) -> dict[str, Any]:

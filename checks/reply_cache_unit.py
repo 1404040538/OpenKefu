@@ -54,7 +54,7 @@ class ReplyCacheConcurrencyTest(unittest.TestCase):
         self.assertEqual(cache.get("new buyer question", 1)["reply"], "third")
 
     def test_entry_evicted_during_embedding_is_not_returned(self):
-        with patch("openkefu.platforms.pdd.chat.reply_cache.MAX_CACHE_SIZE", 2):
+        with patch("openkefu.services.reply_cache.MAX_CACHE_SIZE", 2):
             cache, embedding = self.make_cache(matching=True)
             with ThreadPoolExecutor(max_workers=2) as executor:
                 result = executor.submit(cache.get, NEW_QUERY, 1)
