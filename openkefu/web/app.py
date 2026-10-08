@@ -43,7 +43,7 @@ def create_app() -> FastAPI:
     hub = RealtimeHub(config)
     runtime_logger = RuntimeLogger(db, hub)
     runtime = ShopRuntimeManager(db, hub, runtime_logger, config)
-    knowledge = KnowledgeService(db, config)
+    knowledge_service = KnowledgeService(db, config)
     note_service = NoteSetService(db)
 
     ctx = AppContext(
@@ -52,7 +52,7 @@ def create_app() -> FastAPI:
         hub=hub,
         runtime_logger=runtime_logger,
         runtime=runtime,
-        knowledge=knowledge,
+        knowledge=knowledge_service,
         note_service=note_service,
     )
 
@@ -74,7 +74,7 @@ def create_app() -> FastAPI:
     app.state.hub = hub
     app.state.runtime_logger = runtime_logger
     app.state.runtime = runtime
-    app.state.knowledge = knowledge
+    app.state.knowledge = knowledge_service
     app.state.note_service = note_service
 
     @app.middleware("http")

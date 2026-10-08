@@ -69,6 +69,8 @@ class LLMConfig:
     api_key: str
     base_url: str
     model: str
+    timeout_seconds: float = 20.0
+    disable_thinking: bool | None = None  # None=自动：仅 DeepSeek 生效
 
 
 @dataclass(frozen=True)
@@ -76,13 +78,6 @@ class EmbeddingConfig:
     api_key: str
     base_url: str
     model: str
-
-
-@dataclass(frozen=True)
-class VectorStoreConfig:
-    provider: str
-    path: str
-    collection: str
 
 
 @dataclass(frozen=True)
@@ -100,7 +95,6 @@ class AppConfig:
     logging: LoggingConfig
     llm: LLMConfig
     embedding: EmbeddingConfig
-    vector_store: VectorStoreConfig
     storage: StorageConfig
 
 
@@ -202,12 +196,17 @@ def load_config(path: Path | None = None) -> AppConfig:
     logging = _section(data, "logging")
     llm = _optional_section(data, "llm")
     embedding = _optional_section(data, "embedding")
-    vector_store = _optional_section(data, "vector_store")
     storage = _optional_section(data, "storage")
 
     llm_api_key = str(llm.get("api_key") or os.getenv("OPENKEFU_LLM_API_KEY") or "")
     llm_base_url = str(llm.get("base_url") or os.getenv("OPENKEFU_LLM_BASE_URL") or "https://api.deepseek.com")
     llm_model = str(llm.get("model") or os.getenv("OPENKEFU_LLM_MODEL") or "deepseek-v4-flash")
+    llm_disable_thinking_raw = llm.get("disable_thinking", None)
+    if llm_disable_thinking_raw is None:
+        llm_disable_thinking_raw = os.getenv("OPENKEFU_LLM_DISABLE_THINKING")
+    llm_disable_thinking = (
+        _bool(llm_disable_thinking_raw, True) if llm_disable_thinking_raw is not None else None
+    )
     embedding_api_key = str(embedding.get("api_key") or os.getenv("OPENKEFU_EMBEDDING_API_KEY") or "")
     embedding_base_url = str(embedding.get("base_url") or os.getenv("OPENKEFU_EMBEDDING_BASE_URL") or "")
     embedding_model = str(embedding.get("model") or os.getenv("OPENKEFU_EMBEDDING_MODEL") or "")
@@ -222,13 +221,6 @@ def load_config(path: Path | None = None) -> AppConfig:
     mysql_ssl_ca = str(mysql.get("ssl_ca") or os.getenv("OPENKEFU_MYSQL_SSL_CA") or "").strip()
     if not _is_loopback_host(mysql_host) and not mysql_ssl_ca:
         raise RuntimeError("remote mysql.host requires mysql.ssl_ca for certificate-verified TLS")
-    vector_store_provider = str(vector_store.get("provider") or "mysql").strip().lower()
-    # Chroma was previously embedded locally. Treat the legacy setting as a
-    # migration alias so existing private configs move to MySQL automatically.
-    if vector_store_provider == "chroma":
-        vector_store_provider = "mysql"
-    if vector_store_provider != "mysql":
-        raise RuntimeError("vector_store.provider must be mysql")
     runtime_role = str(os.getenv("OPENKEFU_RUNTIME_ROLE") or runtime.get("role") or "both").lower()
     if runtime_role not in {"api", "worker", "both"}:
         raise RuntimeError("runtime.role must be one of: api, worker, both")
@@ -266,11 +258,11 @@ def load_config(path: Path | None = None) -> AppConfig:
             or parsed_origin.fragment
         ):
             raise RuntimeError("security.allowed_origins must contain exact http(s) origins; wildcard is forbidden")
-    # 测试环境可禁用限流（OPENKEFU_RATE_LIMIT_DISABLED=1 或 security.rate_limit_disabled=true）；
-    # 生产环境保持默认开启。
+    # 限流默认关闭：所有请求不做频率限制。
+    # 如需恢复限流，显式配置 security.rate_limit_disabled=false。
     rate_limit_disabled = (
         str(os.getenv("OPENKEFU_RATE_LIMIT_DISABLED") or "").strip().lower() in {"1", "true", "yes", "on"}
-        or _bool(security.get("rate_limit_disabled"), False)
+        or _bool(security.get("rate_limit_disabled"), True)
     )
 
     return AppConfig(
@@ -317,16 +309,15 @@ def load_config(path: Path | None = None) -> AppConfig:
             api_key=llm_api_key,
             base_url=llm_base_url,
             model=llm_model,
+            timeout_seconds=max(5.0, float(
+                os.getenv("OPENKEFU_LLM_TIMEOUT_SECONDS") or llm.get("timeout_seconds") or 20.0
+            )),
+            disable_thinking=llm_disable_thinking,
         ),
         embedding=EmbeddingConfig(
             api_key=embedding_api_key,
             base_url=embedding_base_url,
             model=embedding_model,
-        ),
-        vector_store=VectorStoreConfig(
-            provider=vector_store_provider,
-            path=str(vector_store.get("path") or ""),
-            collection=str(vector_store.get("collection") or "openkefu_knowledge"),
         ),
         storage=StorageConfig(
             knowledge_dir=str(storage.get("knowledge_dir") or "data/knowledge_files"),
