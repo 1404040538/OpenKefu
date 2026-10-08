@@ -2838,8 +2838,12 @@ class ShopRunner:
 
     @staticmethod
     def _knowledge_query(history: list[dict[str, str]]) -> str:
-        user_items = [item["content"] for item in history if item.get("role") == "user" and item.get("content")]
-        return "\n".join(user_items[-3:])[:3000]
+        # 只用最后一条顾客消息做检索：多条消息拼接会稀释向量语义
+        # （与 qianniu 运行时保持一致）。
+        for item in reversed(history):
+            if item.get("role") == "user" and item.get("content"):
+                return str(item["content"])[:1000]
+        return history[-1]["content"][:1000] if history else ""
 
     def _store_intent_event(
         self,

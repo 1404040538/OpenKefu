@@ -112,7 +112,7 @@ class ImpaasClientConfig:
     def __init__(self, *, url: str = IMPAAS_WSS_URL, appkey: str = QN_IM_APPKEY,
                  heartbeat_interval: float = 15.0, recv_timeout: float = 5.0,
                  rpc_timeout: float = 15.0, reconnect_backoff: float = 5.0,
-                 history_fetch_count: int = 10):
+                 history_fetch_count: int = 10, poll_interval: float = 12.0):
         self.url = url
         self.appkey = appkey
         self.heartbeat_interval = heartbeat_interval
@@ -120,6 +120,7 @@ class ImpaasClientConfig:
         self.rpc_timeout = rpc_timeout
         self.reconnect_backoff = reconnect_backoff
         self.history_fetch_count = history_fetch_count
+        self.poll_interval = poll_interval
 
 
 class ImpaasClient:
@@ -151,8 +152,8 @@ class ImpaasClient:
         self._waiters: dict[str, tuple[threading.Event, dict]] = {}
         self._waiters_lock = threading.Lock()
         self._seen_message_ids: dict[str, float] = {}
-        self._baselined_cids: set[str] = set()
-        self._connected_at = int(time.time() * 1000)
+        self._conv_modify: dict[str, int] = {}  # cid -> 最近观察到的 modifyTime（轮询基线）
+        self._session_start = int(time.time() * 1000)
         self._device_id = new_device_id()
         self._access_token = ""
         # 推送处理线程池：避免在收帧线程内同步等 RPC 响应（会自锁）
@@ -234,12 +235,23 @@ class ImpaasClient:
                         return
 
             threading.Thread(target=_heartbeat_loop, name="impaas-heartbeat", daemon=True).start()
+            last_poll = time.time()
             try:
                 while not self._stop.is_set():
                     try:
                         raw = ws.recv()
                     except websocket.WebSocketTimeoutException:
                         raw = None
+                    now = time.time()
+                    if now - last_poll >= self.config.poll_interval:
+                        last_poll = now
+                        # 轮询兜底：买家消息推送可能被手机端会话抢槽吞掉
+                        # （推送唤醒手机淘宝的卖家会话→互踢→积压被手机端消费），
+                        # 靠 modifyTime 变化发现新消息，不依赖推送
+                        try:
+                            self._push_executor.submit(self._poll_conversations)
+                        except RuntimeError:
+                            pass
                     if raw:
                         self._handle_frame(raw, reg_mid)
                         if self.status != "online" and self.my_uid:
@@ -272,10 +284,11 @@ class ImpaasClient:
             return
         headers = frame.get("headers", {})
         mid = str(headers.get("mid", "")).split(" ")[0]
+        logger.debug("impaas frame recv uri=%s mid=%s code=%s len=%d",
+                     frame.get("lwp", "-"), mid, frame.get("code"), len(raw))
 
         if headers.get("reg-sid"):
             self.my_uid = str(headers.get("reg-uid", ""))
-            self._connected_at = int(time.time() * 1000)
             self._resolve_waiter(reg_mid, frame)
             # 异步对齐同步游标（响应到达后由 pts 分支 ackDiff）
             try:
@@ -296,16 +309,16 @@ class ImpaasClient:
             if mid:
                 self._resolve_waiter(mid, frame)
             return
-        # 推送（无 code，带 mid = 服务端发起的 LWP 请求，必须应答，
-        # 否则后续发送新请求会被服务端断连——SDK 的 pushHandler 返回
-        # {code:200, headers:{}, body:{}} 即此应答）
+        # 推送（无 code，带 mid = 服务端发起的 LWP 请求，必须应答）。
+        # 应答格式按真实 SDK 抓包：{code:200, headers:{app-key, mid(完整含" 0"), ua}, body:{}}
+        # ——只回显关联三项，多带 sid/dt 会被服务端断连
         uri = frame.get("lwp", "")
         if uri in ("/s/sync", "/s/para", "/s/session/remove"):
-            if mid:
-                try:
-                    self._send_frame({"headers": {"mid": mid}, "code": 200, "body": {}})
-                except Exception:
-                    logger.exception("push ack failed")
+            ack_headers = {k: headers[k] for k in ("app-key", "mid", "ua") if k in headers}
+            try:
+                self._send_frame({"code": 200, "headers": ack_headers, "body": {}})
+            except Exception:
+                logger.exception("push ack failed")
             self._handle_push(frame)
 
     def _handle_push(self, frame: dict) -> None:
@@ -335,6 +348,31 @@ class ImpaasClient:
             except RuntimeError:
                 pass  # 已 shutdown
 
+    def _poll_conversations(self) -> None:
+        """轮询会话 modifyTime，发现变化即拉取新消息（推送兜底）。"""
+        try:
+            response = self.rpc("/r/Conversation/listNewestPagination",
+                                [9007199254740991, 10],
+                                timeout=self.config.poll_interval * 0.8)
+        except Exception:
+            return  # 连接切换窗口内的轮询失败直接放弃，下轮再查
+        body = response.get("body") or {}
+        for uc in (body.get("userConvs") or []):
+            sc = uc.get("singleChatUserConversation") or {}
+            cid = str((sc.get("singleChatConversation") or {}).get("cid") or "")
+            modify = int(sc.get("modifyTime") or 0)
+            if not cid:
+                continue
+            known = self._conv_modify.get(cid)
+            if known is None:
+                # 未知会话：早于本次进程启动的只记基线；启动后活跃的立即拉取
+                self._conv_modify[cid] = modify
+                if modify >= self._session_start:
+                    self._fetch_new_messages(cid)
+            elif modify > known:
+                self._conv_modify[cid] = modify
+                self._fetch_new_messages(cid)
+
     def _fetch_new_messages(self, cid: str) -> None:
         """增量拉取会话新消息并回调。"""
         try:
@@ -348,9 +386,7 @@ class ImpaasClient:
         models = body.get("userMessageModels") if isinstance(body, dict) else None
         if not models:
             return
-        self._baselined_cids.add(cid)
         now = time.time()
-        first_fetch = cid not in self._baselined_cids
         fresh: list[ImpaasMessage] = []
         for model in models:
             message = parse_message(model)
@@ -359,14 +395,13 @@ class ImpaasClient:
             if message.message_id in self._seen_message_ids:
                 continue
             self._seen_message_ids[message.message_id] = now
-            if first_fetch:
-                continue  # 首次拉取只做基线，不回放历史消息
             if self.my_uid and message.sender_uid == self.my_uid:
                 continue  # 自己发的
             if message.content_type in (0,):
                 continue
-            # 兜底：跳过早于连接建立的消息（时钟/乱序保护）
-            if message.create_at and message.create_at < self._connected_at - 60_000:
+            # 时间兜底：跳过早于本次进程启动的消息（防历史回放），
+            # 启动后任何时点（含断线窗口）的消息都放行
+            if message.create_at and message.create_at < self._session_start - 60_000:
                 continue
             fresh.append(message)
         # 清理过期去重键（保留 1 小时）
@@ -391,6 +426,10 @@ class ImpaasClient:
         if ws is None:
             raise RuntimeError("impaas socket not connected")
         payload = json.dumps(frame)
+        logger.debug("impaas frame send uri=%s mid=%s code=%s len=%d",
+                     frame.get("lwp", "-"),
+                     str(frame.get("headers", {}).get("mid", "-")),
+                     frame.get("code"), len(payload))
         with self._send_lock:
             ws.send(payload)
         return str(frame.get("headers", {}).get("mid", "")).split(" ")[0]

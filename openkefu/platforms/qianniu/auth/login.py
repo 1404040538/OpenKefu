@@ -221,8 +221,12 @@ class Login:
         if _is_punished(response):
             raise RiskControlError(f"x5sec punish: {response.url[:200]}")
         body = response.json()
-        data = (body.get("content") or {}).get("data") or {}
-        if not body.get("success") or data.get("resultCode") not in (100, None):
+        # 响应结构：{"content": {"data": {...}, "status": 0, "success": true}, "hasError": false}
+        content = body.get("content") or {}
+        data = content.get("data") or {}
+        result_code = data.get("resultCode")
+        succeeded = bool(body.get("success") or content.get("success") or result_code == 100)
+        if not succeeded:
             raise LoginSystemError(f"complete_login failed: {json.dumps(body, ensure_ascii=False)[:300]}")
         self.nick = (params.get("uid") or "").removeprefix("cntaobao")
         self.user_id = session_cookie_dict(self.session).get("unb")

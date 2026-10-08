@@ -41,8 +41,8 @@ def analyze_customer_intent(
             max_tokens=1024,
             max_retries=1,
         )
-        data = json.loads(content)
-        result = normalize_intent_result(data)
+        data = _parse_llm_json(content)
+        result = normalize_intent_result(data, user_text=_latest_user_content(normalized_history))
         return _repair_empty_knowledge_reply(
             result,
             normalized_history,
@@ -66,8 +66,25 @@ def analyze_customer_intent(
                 }
             ],
             "error": error_msg,
-        }
+        },
+        user_text=_latest_user_content(normalized_history),
     )
+
+
+def _parse_llm_json(content: str) -> dict[str, Any]:
+    """容忍模型输出包裹 ```json 栅栏或前后缀杂文的场景。"""
+    text = str(content or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        return json.loads(text)
+    except ValueError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(text[start:end + 1])
+        raise
 
 
 def _repair_empty_knowledge_reply(

@@ -33,6 +33,7 @@ from openkefu.platforms.pdd.chat.knowledge import KnowledgeService, NoteSetServi
 from openkefu.platforms.pdd.chat.llm import LLMClient, get_llm_client
 from openkefu.platforms.pdd.chat.orders import OrderService
 from openkefu.platforms.pdd.chat.reply_cache import ReplyCache
+from openkefu.services.embedding import build_embed_fn
 from openkefu.platforms.pdd.chat.return_records import ReturnRecordService
 from openkefu.platforms.pdd.chat.send_policy import (
     is_session_expired,
@@ -91,7 +92,8 @@ class ShopRuntimeManager:
     @property
     def reply_cache(self) -> ReplyCache:
         if self._reply_cache is None:
-            self._reply_cache = ReplyCache(self.llm_client, self.config.embedding)
+            # 语义相似匹配必须走 embedding 配置的供应商，而非 LLM 客户端。
+            self._reply_cache = ReplyCache(build_embed_fn(self.config.embedding))
         return self._reply_cache
 
     def runner(self, shop_id: int) -> ShopRunner:

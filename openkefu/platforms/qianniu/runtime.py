@@ -265,6 +265,9 @@ class QianniuShopRunner:
         if not cookies:
             self._set_error(RuntimeError("千牛登录缓存为空，请重新扫码登录"))
             return
+        # 回填身份（会话入库的 mall_id 过滤依赖它）
+        self.mall_id = self.mall_id or str((login_result or {}).get("user_id") or "") or None
+        self.nick = self.nick or (login_result or {}).get("nick")
         session = requests.Session()
         session.trust_env = False
         session.headers.update({"User-Agent": DEFAULT_USER_AGENT,
@@ -306,7 +309,7 @@ class QianniuShopRunner:
                 "create_at": message.create_at,
             }})
         self.runtime_logger.log("INFO", __name__, "qianniu.message", "messages received",
-                                shop_id=self.shop_id, count=len(messages))
+                                shop_id=self.shop_id, context={"count": len(messages)})
         # 卡片消息（contentType 101）是浏览上下文，不触发自动回复
         text_messages = [m for m in messages if m.content_type == 1]
         if not (text_messages and self._auto_reply_enabled() and self.im_client):
@@ -340,7 +343,7 @@ class QianniuShopRunner:
             self._store_outbound_message(message, str(result.get("messageId") or ""), content)
             self.runtime_logger.log("INFO", __name__, "qianniu.reply",
                                      "reply sent", shop_id=self.shop_id,
-                                     cid=message.cid, source=source, length=len(content))
+                                     context={"cid": message.cid, "source": source, "length": len(content)})
         except Exception:
             logger.exception("qianniu send reply failed")
 
@@ -380,7 +383,7 @@ class QianniuShopRunner:
 
         # 4. LLM 意图分析生成
         history = self._llm_history(conversation_id)
-        compressed = build_conversation_messages(history, self.llm_client)
+        compressed = build_conversation_messages(history)
         knowledge_hits = self.knowledge.search_for_shop(
             shop_id=self.shop_id, query=self._knowledge_query(history), top_k=5)
         shop_notes = self.note_service.get_items_for_shop(self.shop_id)
@@ -394,7 +397,7 @@ class QianniuShopRunner:
         if not reply:
             self.runtime_logger.log("INFO", __name__, "qianniu.reply.empty",
                                      "llm produced empty reply", shop_id=self.shop_id,
-                                     cid=message.cid)
+                                     context={"cid": message.cid})
             return
         self._deliver_reply(message, conversation_id, reply, source="llm")
         # 记录意图事件（对齐 PDD 的分析留痕）

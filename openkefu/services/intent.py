@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 from typing import Any
 
@@ -80,21 +79,12 @@ def build_intent_messages(
     *,
     business_context: str | None = None,
 ) -> list[dict[str, str]]:
+    # 消息顺序：稳定内容在前（店铺注意事项、知识库），易变内容在后
+    # （实时业务上下文、对话历史）。供应商的前缀缓存只认稳定前缀，
+    # 把每条消息都变化的 business_context 放前面会让缓存几乎全部失效。
     knowledge_text = _format_knowledge(knowledge_hits)
     notes_text = _format_notes(shop_notes)
     messages = [{"role": "system", "content": INTENT_SYSTEM_PROMPT}]
-    if business_context:
-        messages.append(
-            {
-                "role": "system",
-                "content": (
-                    "以下是实时业务上下文，由系统接口提供，内容是严格 JSON。请优先基于这些数据回复顾客；"
-                    "订单状态、物流、退款、商品价格、库存、规格等事实只允许使用 raw_response 或 raw_message 中明确给出的内容。"
-                    "若条目 status=not_found，必须如实回答没有查询到对应订单或商品；若 status=failed/unavailable，只能说明暂时无法核实，不得编造缺失信息。\n"
-                    + business_context.strip()
-                ),
-            }
-        )
     if notes_text:
         messages.append(
             {
@@ -111,11 +101,23 @@ def build_intent_messages(
         )
     else:
         messages.append({"role": "system", "content": "当前没有可用的知识库片段。该信息仅供你内部判断，不要在回复中提到知识库或未配置知识库。普通咨询请用通用客服口径回答；无法确认的店铺专有事实请礼貌说明需要核实或以实际页面/发货后物流为准。"})
+    if business_context:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "以下是实时业务上下文，由系统接口提供，内容是严格 JSON。请优先基于这些数据回复顾客；"
+                    "订单状态、物流、退款、商品价格、库存、规格等事实只允许使用 raw_response 或 raw_message 中明确给出的内容。"
+                    "若条目 status=not_found，必须如实回答没有查询到对应订单或商品；若 status=failed/unavailable，只能说明暂时无法核实，不得编造缺失信息。\n"
+                    + business_context.strip()
+                ),
+            }
+        )
     messages.extend(history)
     return messages
 
 
-def normalize_intent_result(data: Any) -> dict[str, Any]:
+def normalize_intent_result(data: Any, *, user_text: str = "") -> dict[str, Any]:
     if not isinstance(data, dict):
         data = {}
 
@@ -139,7 +141,10 @@ def normalize_intent_result(data: Any) -> dict[str, Any]:
     needs_human = (
         confidence < LOW_CONFIDENCE_THRESHOLD
         or resolution_status == "need_human"
-        or _looks_like_human_request(history_text=data)
+        # 只根据顾客原话判断是否点名人工，绝不能检查 LLM 自己生成的
+        # reply 文本——客服回复里出现"人工客服"字样是正常话术，否则会
+        # 大量误触发转人工。
+        or _looks_like_human_request(user_text)
     )
     if needs_human and not any(item["type"] == "transfer_to_human" for item in actions):
         actions.append(
@@ -236,6 +241,6 @@ def _float_between(value: Any, low: float, high: float) -> float:
     return max(low, min(high, number))
 
 
-def _looks_like_human_request(history_text: Any) -> bool:
-    text = json.dumps(history_text, ensure_ascii=False, default=str)
+def _looks_like_human_request(user_text: Any) -> bool:
+    text = str(user_text or "")
     return any(keyword in text for keyword in ("人工", "真人", "投诉", "举报", "平台介入", "别机器人"))

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import difflib
+import logging
+import re
 import threading
 import time
 from collections import OrderedDict
 from typing import Any
 
-from openkefu.services.llm import LLMClient
-from openkefu.web.config import EmbeddingConfig
+from openkefu.services.embedding import EmbedFn
+
+logger = logging.getLogger(__name__)
 
 
 MAX_CACHE_SIZE = 200
@@ -18,9 +21,10 @@ TEXT_PRE_FILTER_RATIO = 0.55
 
 
 class ReplyCache:
-    def __init__(self, llm_client: LLMClient, embedding_config: EmbeddingConfig):
-        self._llm = llm_client
-        self._emb_config = embedding_config
+    def __init__(self, embed_fn: EmbedFn | None):
+        # embed_fn 必须基于 embedding 配置构建（见 build_embed_fn），
+        # 不能复用 LLM 客户端——LLM 供应商未必提供 embeddings 接口。
+        self._embed = embed_fn
         self._entries: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
         self._lock = threading.Lock()
 
@@ -31,25 +35,55 @@ class ReplyCache:
         with self._lock:
             self._expire_stale()
             entries = list(self._entries.items())
+        query_clean = _normalize(query)
         scanned = 0
+        candidates: list[tuple[str, float, dict[str, Any], str]] = []
         for cache_key, (cached_at, entry) in entries:
-            entry_query = entry.get("_cache_query") or ""
-            entry_shop = entry.get("_cache_shop_id")
-            if entry_shop != shop_id:
+            if entry.get("_cache_shop_id") != shop_id:
                 continue
             if scanned >= MAX_CACHE_SCAN:
                 break
             scanned += 1
-            if self._is_similar(query, entry_query):
-                with self._lock:
-                    # 相似度网络请求期间条目可能已过期或被另一线程淘汰。
-                    if cache_key not in self._entries or time.time() - cached_at > CACHE_TTL_SECONDS:
-                        continue
-                    self._entries.move_to_end(cache_key)
-                result = dict(entry)
-                result["_cache_hit"] = True
-                return result
+            entry_query = str(entry.get("_cache_query") or "")
+            if query_clean == _normalize(entry_query):
+                return self._confirm(cache_key, cached_at, entry)
+            if len(query_clean) < 20 and len(_normalize(entry_query)) < 20:
+                continue
+            if self._embed is None:
+                continue
+            # 轻量文本相似度粗筛，避免无谓的 embedding 调用。
+            try:
+                ratio = difflib.SequenceMatcher(None, query_clean, _normalize(entry_query)).ratio()
+            except Exception:
+                continue
+            if ratio >= TEXT_PRE_FILTER_RATIO:
+                candidates.append((cache_key, cached_at, entry, _normalize(entry_query)))
+
+        if not candidates:
+            return None
+        # 一次批量请求：query + 全部候选，避免逐条调用 embedding API。
+        try:
+            vectors = self._embed([query_clean] + [item[3] for item in candidates])
+        except Exception:
+            logger.debug("reply cache embedding failed", exc_info=True)
+            return None
+        if len(vectors) != len(candidates) + 1:
+            return None
+        query_vec = vectors[0]
+        for (cache_key, cached_at, entry, _), entry_vec in zip(candidates, vectors[1:]):
+            if _cosine_similarity(query_vec, entry_vec) >= SIMILARITY_THRESHOLD:
+                return self._confirm(cache_key, cached_at, entry)
         return None
+
+    def _confirm(self, cache_key: str, cached_at: float, entry: dict[str, Any]) -> dict[str, Any] | None:
+        with self._lock:
+            # 相似度网络请求期间条目可能已过期或被另一线程淘汰。
+            if cache_key not in self._entries or time.time() - cached_at > CACHE_TTL_SECONDS:
+                return None
+            self._entries.move_to_end(cache_key)
+        result = dict(entry)
+        result["_cache_hit"] = True
+        return result
 
     def put(self, query: str, shop_id: int, intent: dict[str, Any]) -> None:
         query = query.strip()
@@ -64,30 +98,6 @@ class ReplyCache:
             if len(self._entries) > MAX_CACHE_SIZE:
                 self._entries.popitem(last=False)
 
-    def _is_similar(self, a: str, b: str) -> bool:
-        if a == b:
-            return True
-        a_clean = _normalize(a)
-        b_clean = _normalize(b)
-        if a_clean == b_clean:
-            return True
-        if len(a_clean) < 20 and len(b_clean) < 20:
-            return False
-        # 先用轻量文本相似度粗筛，过滤明显不相关的候选，
-        # 避免对每条缓存都发起 embedding API 调用。
-        try:
-            if difflib.SequenceMatcher(None, a_clean, b_clean).ratio() < TEXT_PRE_FILTER_RATIO:
-                return False
-        except Exception:
-            pass
-        try:
-            emb_a = self._llm.embed([a_clean], model=self._emb_config.model)
-            emb_b = self._llm.embed([b_clean], model=self._emb_config.model)
-            similarity = _cosine_similarity(emb_a[0], emb_b[0])
-            return similarity >= SIMILARITY_THRESHOLD
-        except Exception:
-            return False
-
     def _expire_stale(self) -> None:
         now = time.time()
         stale_keys = [k for k, (ts, _) in self._entries.items() if now - ts > CACHE_TTL_SECONDS]
@@ -96,10 +106,8 @@ class ReplyCache:
 
 
 def _normalize(text: str) -> str:
-    import re
     text = re.sub(r"\s+", "", text)
-    text = text.lower()
-    return text.strip()
+    return text.lower().strip()
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
