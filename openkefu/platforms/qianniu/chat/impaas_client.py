@@ -27,6 +27,7 @@ import websocket
 from openkefu.platforms.qianniu.chat.models import (
     ImpaasConversation,
     ImpaasMessage,
+    encode_custom_image,
     parse_conversation,
     parse_message,
 )
@@ -44,6 +45,12 @@ IM_TOKEN_API = "mtop.taobao.login.token.get.h5"
 IM_TOKEN_VERSION = "2.0"
 UA_IM = (DEFAULT_USER_AGENT + " DingTalk(2.1.5) OS(Windows/10) "
          "Browser(Chrome/147.0.0.0) DingWeb/2.1.5 IMPaaS DingWeb/2.1.5")
+
+# ampmedia 图片上传（chat-core bundle 模块 3845 逆向 2026-10-08）：
+# web 会话 multipart 直传，appkey=ampmedia，响应 {success, object:{fileId,url,size,pix,fileName}}
+AMPMEDIA_UPLOAD_URL = "https://stream-upload.taobao.com/api/upload.api"
+AMPMEDIA_APPKEY = "ampmedia"
+AMPMEDIA_MAX_BYTES = 10 * 1024 * 1024
 
 CID_RE = re.compile(r"\d+\.1-\d+\.1#\d+@cntaobao")
 
@@ -515,3 +522,65 @@ class ImpaasClient:
         if not body.get("messageId"):
             raise RuntimeError(f"send_text no messageId: {json.dumps(body, ensure_ascii=False)[:200]}")
         return body
+
+    # ---------- 图片消息（ampmedia 上传 + custom IMAGE 编码） ----------
+
+    def upload_image(self, image_bytes: bytes, filename: str = "image.jpg") -> dict:
+        """ampmedia 上传图片，返回 {fileId, url, size, width, height, suffix}。
+
+        走 web 会话 cookie（requests.Session），协议对齐 chat-core 模块 3845。
+        """
+        if len(image_bytes) > AMPMEDIA_MAX_BYTES:
+            raise ValueError("图片大小不能超过 10MB")
+        response = self.session.post(
+            AMPMEDIA_UPLOAD_URL,
+            params={"appkey": AMPMEDIA_APPKEY, "folderId": "0", "_input_charset": "utf-8"},
+            files={"file": (filename, image_bytes, "image/jpeg")},
+            headers={"Referer": "https://market.m.taobao.com/"},
+            timeout=60,
+        )
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise RuntimeError(f"ampmedia upload non-json response: {response.text[:200]}") from exc
+        obj = body.get("object") or {}
+        if not body.get("success") or not obj.get("url"):
+            raise RuntimeError(f"ampmedia upload failed: {json.dumps(body, ensure_ascii=False)[:300]}")
+        width, height = 0, 0
+        pix = str(obj.get("pix") or "")
+        if "x" in pix:
+            parts = pix.split("x", 1)
+            if parts[0].isdigit() and parts[1].isdigit():
+                width, height = int(parts[0]), int(parts[1])
+        url = str(obj["url"])
+        return {
+            "fileId": str(obj.get("fileId") or ""),
+            "url": url,
+            "size": int(obj.get("size") or 0),
+            "width": width,
+            "height": height,
+            "suffix": url.rsplit(".", 1)[-1].lower() if "." in url else "jpg",
+        }
+
+    def send_image(self, cid: str, receiver_uid_num: str, image_bytes: bytes,
+                   filename: str = "image.jpg") -> tuple[dict, str]:
+        """发送图片消息：ampmedia 上传后以 custom(type=7) 编码发送。
+
+        返回 (send 响应 body, 图片 URL)。对齐 web 端 chat-core 行为，
+        买家 web / 移动端均可渲染。
+        """
+        meta = self.upload_image(image_bytes, filename=filename)
+        model = {
+            "uuid": str(uuid_lib.uuid4()),
+            "cid": cid,
+            "conversationType": 1,
+            "content": encode_custom_image(meta),
+            "redPointPolicy": 1, "extension": {}, "ctx": {},
+            "mtags": {}, "msgReadStatusSetting": 1,
+        }
+        response = self.rpc("/r/MessageSend/sendByReceiverScope",
+                            [model, {"actualReceivers": [f"{receiver_uid_num}@cntaobao"]}])
+        body = response.get("body") or {}
+        if not body.get("messageId"):
+            raise RuntimeError(f"send_image no messageId: {json.dumps(body, ensure_ascii=False)[:200]}")
+        return body, meta["url"]
