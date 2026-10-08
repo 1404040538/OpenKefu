@@ -366,6 +366,70 @@ class QianniuShopRunner:
         if status == "error":
             self.runtime_logger.log("WARNING", __name__, "qianniu.im", f"im status={status} {detail}",
                                     shop_id=self.shop_id)
+        if status == "online" and self.im_client:
+            # 上线补拉掉线窗口消息（独立线程：回调可能在收帧线程，勿同步 RPC 自锁）
+            threading.Thread(target=self._backfill_recent_conversations,
+                             name=f"qianniu-backfill-{self.shop_id}", daemon=True).start()
+
+    def _backfill_recent_conversations(self) -> None:
+        """重连/进程重启后补拉掉线窗口的消息（只入库与推送事件，不触发自动回复）。
+
+        impaas 客户端为防历史回放，只放行晚于进程启动时间的消息——
+        跨进程的掉线窗口因此成为盲区。这里按 DB 已知水位
+        （会话最新 message_at）补拉近期活跃会话。
+        """
+        client = self.im_client
+        if not client:
+            return
+        try:
+            rows = self.db.query(
+                """
+                SELECT c.id AS conversation_id, c.conv_id,
+                       MAX(m.message_at) AS last_at
+                FROM conversations c
+                LEFT JOIN messages m ON m.conversation_id = c.id
+                WHERE c.shop_id=%s AND c.chat_type='qianniu_kefu'
+                  AND c.conv_id IS NOT NULL AND c.conv_id <> ''
+                GROUP BY c.id, c.conv_id
+                ORDER BY last_at DESC
+                LIMIT 10
+                """,
+                (self.shop_id,),
+            )
+        except Exception:
+            logger.exception("qianniu backfill query failed")
+            return
+        backfilled = 0
+        for row in rows:
+            cid = str(row.get("conv_id") or "")
+            last_at = int(row.get("last_at") or 0)
+            if not cid or not self.im_client:
+                break
+            try:
+                messages = client.list_messages(cid, count=10)
+            except Exception:
+                logger.exception("qianniu backfill list_messages failed cid=%s", cid)
+                continue
+            for message in messages:
+                if message.create_at <= last_at:
+                    continue
+                conversation_id = self._store_message(message)
+                backfilled += 1
+                self.hub.publish({"type": "qianniu_message", "data": {
+                    "shop_id": self.shop_id,
+                    "conversation_id": conversation_id,
+                    "cid": message.cid,
+                    "sender_uid": message.sender_uid_num,
+                    "text": message.text,
+                    "kind": message.kind,
+                    "content_type": message.content_type,
+                    "message_id": message.message_id,
+                    "create_at": message.create_at,
+                }})
+        if backfilled:
+            self.runtime_logger.log("INFO", __name__, "qianniu.backfill",
+                                    "backfilled offline-window messages",
+                                    shop_id=self.shop_id, context={"count": backfilled})
 
     def _on_messages(self, messages: list[ImpaasMessage]) -> None:
         for message in messages:
