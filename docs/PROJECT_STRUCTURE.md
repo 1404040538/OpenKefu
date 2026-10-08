@@ -14,7 +14,7 @@
 
 | 文件 | 类型 | 功能 |
 |---|---|---|
-| `config.local.json` | 唯一配置 `[不入库]` | 全部运行配置：server/mysql/redis/runtime/security/logging/llm/embedding/vector_store/storage。含 MySQL 口令、API Key 与三个必填随机密钥（jwt_secret / command_secret / data_encryption_key） |
+| `config.local.json` | 唯一配置 `[不入库]` | 全部运行配置：server/mysql/redis/runtime/security/logging/llm/embedding/storage。含 MySQL 口令、API Key 与三个必填随机密钥（jwt_secret / command_secret / data_encryption_key） |
 | `config.example.json` | 配置模板 `[入库]` | 首次部署复制为 `config.local.json` 后填写 |
 
 ## 三、核心包 `openkefu/`

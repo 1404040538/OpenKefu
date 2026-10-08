@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import time
-from functools import lru_cache
-from typing import Any, Generator
+from typing import Any
 
 from openai import OpenAI
 
@@ -19,6 +18,12 @@ class LLMClient:
             raise RuntimeError("缺少大模型 API Key，请在 config.local.json 的 llm.api_key 或环境变量中配置")
         self.config = config
         self._client = OpenAI(api_key=config.api_key, base_url=config.base_url)
+        # thinking 禁用是 DeepSeek 方言；其他供应商可能对未知字段报 400。
+        # 默认仅对 DeepSeek 生效，可用 llm.disable_thinking 显式覆盖。
+        if config.disable_thinking is None:
+            self._disable_thinking = "deepseek" in (config.base_url or "").lower()
+        else:
+            self._disable_thinking = config.disable_thinking
 
     @property
     def model(self) -> str:
@@ -40,7 +45,7 @@ class LLMClient:
         temperature: float = 0.0,
         max_tokens: int = 1024,
         response_format: str | None = None,
-        timeout: float = DEFAULT_TIMEOUT,
+        timeout: float | None = None,
         max_retries: int = DEFAULT_MAX_RETRIES,
     ) -> str:
         kwargs = self._build_kwargs(
@@ -50,41 +55,12 @@ class LLMClient:
             max_tokens=max_tokens,
             response_format=response_format,
             stream=False,
-            timeout=timeout,
+            timeout=timeout if timeout is not None else self.config.timeout_seconds,
         )
         content = self._call_with_retry(kwargs, max_retries=max_retries)
         if not content or not content.strip():
             raise RuntimeError("大模型返回空回复")
         return content.strip()
-
-    def chat_stream(
-        self,
-        messages: list[dict[str, str]],
-        *,
-        model: str | None = None,
-        temperature: float = 0.0,
-        max_tokens: int = 1024,
-        timeout: float = DEFAULT_TIMEOUT,
-    ) -> Generator[str, None, None]:
-        kwargs = self._build_kwargs(
-            messages=messages,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format=None,
-            stream=True,
-            timeout=timeout,
-        )
-        response = self._client.chat.completions.create(**kwargs)
-        for chunk in response:
-            delta = chunk.choices[0].delta if chunk.choices else None
-            if delta and delta.content:
-                yield delta.content
-
-    def embed(self, texts: list[str], *, model: str | None = None, timeout: float = 60) -> list[list[float]]:
-        emb_model = model or self.config.model
-        response = self._client.embeddings.create(model=emb_model, input=texts, timeout=timeout)
-        return [list(item.embedding) for item in response.data]
 
     def _build_kwargs(
         self,
@@ -104,8 +80,9 @@ class LLMClient:
             "max_tokens": max_tokens,
             "stream": stream,
             "timeout": timeout,
-            "extra_body": {"thinking": {"type": "disabled"}},
         }
+        if self._disable_thinking:
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         if response_format:
             kwargs["response_format"] = {"type": response_format}
         return kwargs
@@ -125,11 +102,6 @@ class LLMClient:
                     delay = DEFAULT_BASE_DELAY * (2 ** attempt)
                     time.sleep(delay)
         raise last_error or RuntimeError("LLM 调用失败")
-
-
-@lru_cache(maxsize=8)
-def _client_from_config(api_key: str, base_url: str, model: str) -> OpenAI:
-    return OpenAI(api_key=api_key, base_url=base_url)
 
 
 _llm_clients: dict[str, LLMClient] = {}

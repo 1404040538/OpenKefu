@@ -5,26 +5,48 @@ import difflib
 import hashlib
 import io
 import json
+import logging
 import re
 import shutil
+import threading
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from openai import OpenAI
 
 from openkefu.services import PROJECT_ROOT
+from openkefu.services.embedding import build_embed_fn
 from openkefu.web.config import AppConfig
 from openkefu.web.db import Database, json_dumps
 
+logger = logging.getLogger(__name__)
+
 
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".csv", ".xlsx", ".docx", ".pdf"}
+
+# 店铺向量索引内存缓存：避免每条顾客消息都全量拉取 chunk 的
+# embedding_json（LONGTEXT，每行可达数十 KB）并在 Python 里逐条解析。
+INDEX_CACHE_MAX_SHOPS = 8
+
+
+@dataclass
+class _ShopIndex:
+    fingerprint: tuple
+    rows: list[dict[str, Any]] = field(default_factory=list)
+    # (n, dim) float32，行向量已归一化，余弦相似度退化为点积。
+    vectors: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=np.float32))
 
 
 class KnowledgeService:
     def __init__(self, db: Database, config: AppConfig):
         self.db = db
         self.config = config
+        self._embed_fn = build_embed_fn(config.embedding)
+        self._index_cache: OrderedDict[int, _ShopIndex] = OrderedDict()
+        self._index_lock = threading.Lock()
+        self._embed_config_warned = False
 
     def list_knowledge_bases(self) -> list[dict[str, Any]]:
         rows = self.db.query(
@@ -236,36 +258,33 @@ class KnowledgeService:
             if not chunks:
                 raise ValueError("文件没有解析出可用文本")
 
+            kb_id = file_row["knowledge_base_id"]
+            # vector_id 由 file_id+chunk_index 确定，无需插入后再逐行回填。
+            insert_values = [
+                (kb_id, file_id, index, content, source_label, f"chunk:{file_id}:{index}")
+                for index, (content, source_label) in enumerate(chunks)
+            ]
             self.db.execute("DELETE FROM knowledge_chunks WHERE file_id=%s", (file_id,))
-            chunk_rows = []
-            for index, (content, source_label) in enumerate(chunks):
-                chunk_id = self.db.execute(
-                    """
-                    INSERT INTO knowledge_chunks
-                    (knowledge_base_id, file_id, chunk_index, content, source_label, token_count)
-                    VALUES (%s,%s,%s,%s,%s,%s)
-                    """,
-                    (
-                        file_row["knowledge_base_id"],
-                        file_id,
-                        index,
-                        content,
-                        source_label,
-                        max(1, len(content) // 2),
-                    ),
-                )
-                vector_id = f"chunk:{chunk_id}"
-                self.db.execute("UPDATE knowledge_chunks SET vector_id=%s WHERE id=%s", (vector_id, chunk_id))
-                chunk_rows.append({"id": chunk_id, "vector_id": vector_id, "content": content, "source_label": source_label})
+            self.db.execute_many(
+                """
+                INSERT INTO knowledge_chunks
+                (knowledge_base_id, file_id, chunk_index, content, source_label, vector_id)
+                VALUES (%s,%s,%s,%s,%s,%s)
+                """,
+                insert_values,
+            )
 
-            embeddings = self._embed([item["content"] for item in chunk_rows])
-            if len(embeddings) != len(chunk_rows):
+            embeddings = self._embed([content for content, _ in chunks])
+            if len(embeddings) != len(chunks):
                 raise RuntimeError("embedding result count does not match knowledge chunks")
-            for item, embedding in zip(chunk_rows, embeddings):
-                self.db.execute(
-                    "UPDATE knowledge_chunks SET embedding_json=%s WHERE id=%s",
-                    (json_dumps(embedding), item["id"]),
-                )
+            current_model = self.config.embedding.model
+            self.db.execute_many(
+                "UPDATE knowledge_chunks SET embedding_json=%s, embedding_model=%s WHERE file_id=%s AND chunk_index=%s",
+                [
+                    (json_dumps(embedding), current_model, file_id, index)
+                    for index, embedding in enumerate(embeddings)
+                ],
+            )
             self.db.execute("UPDATE knowledge_files SET status='ready', error=NULL WHERE id=%s", (file_id,))
         except Exception as exc:
             self.db.execute("UPDATE knowledge_files SET status='failed', error=%s WHERE id=%s", (str(exc), file_id))
@@ -275,36 +294,103 @@ class KnowledgeService:
         query = query.strip()
         if not query:
             return []
+        if self._embed_fn is None:
+            if not self._embed_config_warned:
+                self._embed_config_warned = True
+                logger.warning("embedding 未配置，知识库语义检索不可用（QA 问答与注意事项不受影响）")
+            return []
         try:
-            eligible = self._eligible_chunks(shop_id)
-            if not eligible:
+            index = self._shop_index(shop_id)
+            if index is None or not index.rows or index.vectors.size == 0:
                 return []
-            self._ensure_chunk_embeddings(eligible)
-            query_embedding = np.asarray(self._embed([query])[0], dtype=np.float32)
+            query_embedding = np.asarray(self._embed_fn([query[:1000]])[0], dtype=np.float32)
             query_norm = float(np.linalg.norm(query_embedding))
             if not query_norm:
                 return []
+            query_embedding = query_embedding / query_norm
+            similarities = index.vectors @ query_embedding
+            order = np.argsort(-similarities)[:top_k]
+            hits: list[dict[str, Any]] = []
+            for position in order:
+                similarity = float(similarities[position])
+                row = dict(index.rows[int(position)])
+                row["distance"] = 1.0 - max(-1.0, min(1.0, similarity))
+                hits.append(row)
+            return hits
         except Exception:
+            logger.debug("knowledge search failed", exc_info=True)
             return []
 
-        hits: list[dict[str, Any]] = []
-        for item in eligible:
+    def _shop_index(self, shop_id: int) -> _ShopIndex | None:
+        fingerprint = self._index_fingerprint(shop_id)
+        with self._index_lock:
+            cached = self._index_cache.get(shop_id)
+            if cached is not None and cached.fingerprint == fingerprint:
+                self._index_cache.move_to_end(shop_id)
+                return cached
+
+        rows = self._eligible_chunks(shop_id)
+        if self._ensure_chunk_embeddings(rows):
+            # 回填会改变 missing/stale 计数，指纹需要重算。
+            fingerprint = self._index_fingerprint(shop_id)
+
+        vectors: list[np.ndarray] = []
+        meta_rows: list[dict[str, Any]] = []
+        dimension = 0
+        for row in rows:
             try:
-                chunk_embedding = np.asarray(json.loads(item.get("embedding_json") or "[]"), dtype=np.float32)
+                embedding = np.asarray(json.loads(row.get("embedding_json") or "[]"), dtype=np.float32)
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
-            if chunk_embedding.shape != query_embedding.shape:
+            if embedding.ndim != 1 or embedding.size == 0:
                 continue
-            chunk_norm = float(np.linalg.norm(chunk_embedding))
-            if not chunk_norm:
+            if dimension == 0:
+                dimension = int(embedding.size)
+            elif embedding.size != dimension:
                 continue
-            similarity = float(np.dot(query_embedding, chunk_embedding) / (query_norm * chunk_norm))
-            row = dict(item)
-            row.pop("embedding_json", None)
-            row["distance"] = 1.0 - max(-1.0, min(1.0, similarity))
-            hits.append(row)
-        hits.sort(key=lambda item: float(item.get("distance") or 0.0))
-        return hits[:top_k]
+            norm = float(np.linalg.norm(embedding))
+            if not norm:
+                continue
+            meta = dict(row)
+            meta.pop("embedding_json", None)
+            meta_rows.append(meta)
+            vectors.append(embedding / norm)
+
+        index = _ShopIndex(
+            fingerprint=fingerprint,
+            rows=meta_rows,
+            vectors=(np.vstack(vectors).astype(np.float32) if vectors else np.zeros((0, 0), dtype=np.float32)),
+        )
+        with self._index_lock:
+            self._index_cache[shop_id] = index
+            self._index_cache.move_to_end(shop_id)
+            while len(self._index_cache) > INDEX_CACHE_MAX_SHOPS:
+                self._index_cache.popitem(last=False)
+        return index
+
+    def _index_fingerprint(self, shop_id: int) -> tuple:
+        row = self.db.query_one(
+            """
+            SELECT COUNT(*) AS cnt,
+                   COALESCE(MAX(kc.id), 0) AS max_id,
+                   COALESCE(SUM(kc.embedding_json IS NULL), 0) AS missing_embedding,
+                   COALESCE(SUM(kc.embedding_model IS NULL OR kc.embedding_model <> %s), 0) AS stale_model
+            FROM knowledge_chunks kc
+            JOIN knowledge_files kf ON kf.id=kc.file_id
+            JOIN knowledge_bases kb ON kb.id=kc.knowledge_base_id
+            JOIN knowledge_base_shops kbs ON kbs.knowledge_base_id=kb.id
+            WHERE kbs.shop_id=%s AND kb.status='active' AND kf.status='ready'
+            """,
+            (self.config.embedding.model, shop_id),
+        )
+        if not row:
+            return (0, 0, 0, 0)
+        return (
+            int(row.get("cnt") or 0),
+            int(row.get("max_id") or 0),
+            int(row.get("missing_embedding") or 0),
+            int(row.get("stale_model") or 0),
+        )
 
     def find_qa_match_for_shop(self, *, shop_id: int, query: str) -> dict[str, Any] | None:
         normalized_query = _normalize_question(query)
@@ -355,8 +441,18 @@ class KnowledgeService:
             (shop_id,),
         )
 
-    def _ensure_chunk_embeddings(self, chunks: list[dict[str, Any]], batch_size: int = 64) -> None:
-        missing = [item for item in chunks if not item.get("embedding_json")]
+    def _ensure_chunk_embeddings(self, chunks: list[dict[str, Any]], batch_size: int = 64) -> bool:
+        """回填缺失或模型已更换的向量；返回是否有回填。
+
+        按 embedding_model 判断失效：换 embedding 模型后旧向量维度不同，
+        直接跳过会导致检索永远为空，必须整体重算。
+        """
+        current_model = self.config.embedding.model
+        missing = [
+            item
+            for item in chunks
+            if not item.get("embedding_json") or str(item.get("embedding_model") or "") != current_model
+        ]
         for start in range(0, len(missing), batch_size):
             batch = missing[start:start + batch_size]
             embeddings = self._embed([str(item.get("content") or "") for item in batch])
@@ -365,18 +461,17 @@ class KnowledgeService:
             for item, embedding in zip(batch, embeddings):
                 encoded = json_dumps(embedding)
                 self.db.execute(
-                    "UPDATE knowledge_chunks SET embedding_json=%s WHERE id=%s",
-                    (encoded, item["id"]),
+                    "UPDATE knowledge_chunks SET embedding_json=%s, embedding_model=%s WHERE id=%s",
+                    (encoded, current_model, item["id"]),
                 )
                 item["embedding_json"] = encoded
+                item["embedding_model"] = current_model
+        return bool(missing)
 
     def _embed(self, texts: list[str]) -> list[list[float]]:
-        embedding = self.config.embedding
-        if not embedding.api_key or not embedding.base_url or not embedding.model:
+        if self._embed_fn is None:
             raise RuntimeError("缺少 embedding 配置，请配置 embedding.api_key/base_url/model")
-        client = OpenAI(api_key=embedding.api_key, base_url=embedding.base_url)
-        response = client.embeddings.create(model=embedding.model, input=texts)
-        return [list(item.embedding) for item in response.data]
+        return self._embed_fn(texts)
 
     def _knowledge_dir(self) -> Path:
         path = Path(self.config.storage.knowledge_dir)

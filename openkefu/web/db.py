@@ -609,6 +609,17 @@ class Database:
 
         cursor.execute(
             "SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='knowledge_chunks' AND COLUMN_NAME='embedding_model'",
+            (mysql.database,),
+        )
+        if cursor.fetchone()["cnt"] == 0:
+            cursor.execute(
+                "ALTER TABLE knowledge_chunks ADD COLUMN embedding_model VARCHAR(128) NULL AFTER embedding_json"
+            )
+            logger.info("migration: added embedding_model column to knowledge_chunks")
+
+        cursor.execute(
+            "SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS "
             "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='users' AND COLUMN_NAME='auth_version'",
             (mysql.database,),
         )
@@ -833,7 +844,7 @@ REQUIRED_SCHEMA = {
     ],
     "knowledge_chunks": [
         "id", "knowledge_base_id", "file_id", "chunk_index", "content",
-        "source_label", "vector_id", "embedding_json", "token_count", "created_at",
+        "source_label", "vector_id", "embedding_json", "embedding_model", "token_count", "created_at",
     ],
     "knowledge_qa_items": [
         "id", "knowledge_base_id", "question", "reply", "image_base64",
@@ -1131,6 +1142,7 @@ SCHEMA = [
         source_label VARCHAR(255) NULL,
         vector_id VARCHAR(128) NULL,
         embedding_json LONGTEXT NULL,
+        embedding_model VARCHAR(128) NULL,
         token_count INT NOT NULL DEFAULT 0,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         UNIQUE KEY uk_file_chunk (file_id, chunk_index),
