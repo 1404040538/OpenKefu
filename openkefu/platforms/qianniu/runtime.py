@@ -242,7 +242,22 @@ class QianniuShopRunner:
         if self.im_client and self.im_client.status == "online":
             return {"status": "online", "shop": row}
         self._connect_from_cache()
+        # 连接是后台线程建立的：等待终态（online / stop / 缓存缺失），
+        # 避免立即返回 "closed" 造成"上线没生效"的误判
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            client = self.im_client
+            if client is None or client._stop.is_set():
+                break
+            if client.status == "online":
+                break
+            time.sleep(0.5)
         return {"status": self.im_client.status if self.im_client else "offline", "shop": row}
+
+    def has_live_connection(self) -> bool:
+        """本进程是否仍持有该店铺的活连接（stale cleanup 的豁免判定）。"""
+        with self.lock:
+            return self.im_client is not None
 
     def offline(self) -> None:
         self._disconnect(update_session=True, session_status="offline")
@@ -357,19 +372,26 @@ class QianniuShopRunner:
                 on_status=self._on_im_status,
             )
             self.im_client.start()
-        self.repos.shops.mark_online(self.shop_id, mall_id=self.mall_id or "",
-                                     nickname=self.nick)
+        # 店铺状态在 im 真正 online 时才回写（_on_im_status），
+        # 这里只标 connecting——避免连接尚未建立/失败时 DB 已假在线
+        self._set_shop_status("connecting")
         self.hub.publish({"type": "shop_status", "data": self._shop_row()})
 
     def _on_im_status(self, status: str, detail: Any) -> None:
-        self.hub.publish({"type": "shop_status", "data": self._shop_row()})
-        if status == "error":
+        if status == "online":
+            try:
+                self.repos.shops.mark_online(self.shop_id, mall_id=self.mall_id or "",
+                                             nickname=self.nick)
+            except Exception:
+                logger.exception("qianniu mark_online failed")
+            # 上线补拉掉线窗口消息（独立线程：回调可能在收帧线程，勿同步 RPC 自锁）
+            if self.im_client:
+                threading.Thread(target=self._backfill_recent_conversations,
+                                 name=f"qianniu-backfill-{self.shop_id}", daemon=True).start()
+        elif status == "error":
             self.runtime_logger.log("WARNING", __name__, "qianniu.im", f"im status={status} {detail}",
                                     shop_id=self.shop_id)
-        if status == "online" and self.im_client:
-            # 上线补拉掉线窗口消息（独立线程：回调可能在收帧线程，勿同步 RPC 自锁）
-            threading.Thread(target=self._backfill_recent_conversations,
-                             name=f"qianniu-backfill-{self.shop_id}", daemon=True).start()
+        self.hub.publish({"type": "shop_status", "data": self._shop_row()})
 
     def _backfill_recent_conversations(self) -> None:
         """重连/进程重启后补拉掉线窗口的消息（只入库与推送事件，不触发自动回复）。

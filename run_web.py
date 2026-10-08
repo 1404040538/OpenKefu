@@ -1,11 +1,30 @@
 import argparse
 import os
+import socket
+import sys
 from pathlib import Path
 
 import uvicorn
 
 from openkefu.platforms.pdd.config import PROJECT_ROOT
 from openkefu.web.config import load_config
+
+
+def check_port_free(host: str, port: int) -> None:
+    """启动前预检端口：被占用时给出可操作的报错（常见于 uvicorn reload
+    的残留子进程或上一个未退出的实例）。"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+        except OSError as exc:
+            print(f"[startup] 端口 {host}:{port} 已被占用（{exc}）。", file=sys.stderr)
+            print(
+                "[startup] 可能是上一次运行的残留进程（dev 模式 uvicorn reload 的"
+                "子进程不受父进程退出影响）。请排查：", file=sys.stderr)
+            print(f"[startup]   netstat -ano | findstr :{port}", file=sys.stderr)
+            print("[startup]   taskkill /PID <PID> /F 后重试", file=sys.stderr)
+            raise SystemExit(1)
 
 
 def frontend_build_issue(frontend_dist: str, *, project_root: Path = PROJECT_ROOT) -> str | None:
@@ -74,6 +93,14 @@ def main():
         port = config.server.port
     else:
         port = int(os.getenv("OPENKEFU_DEV_BACKEND_PORT", "8001"))
+
+    check_port_free(config.server.host, port)
+    role = os.environ.get("OPENKEFU_RUNTIME_ROLE") or config.runtime.role
+    print(
+        f"[startup] mode={mode} role={role} pid={os.getpid()} "
+        f"binding={config.server.host}:{port} db={config.mysql.database} "
+        f"redis_db={'-'} lease_ttl={config.runtime.lease_ttl_seconds}s"
+    )
 
     if prod_like_mode:
         build_issue = frontend_build_issue(config.server.frontend_dist)

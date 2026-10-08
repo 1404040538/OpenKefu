@@ -64,7 +64,9 @@ def create_app() -> FastAPI:
         try:
             yield
         finally:
-            runtime.stop_background_services()
+            # 优雅退出：停 runner、释放租约、标记下线。
+            # 在线程池里同步执行，避免事件循环线程直接跑阻塞 IO。
+            await asyncio.to_thread(runtime.shutdown)
             ctx.offline_pool.shutdown(wait=False)
             await hub.stop()
 

@@ -180,6 +180,11 @@ class ShopRunner:
                 raise
             return {"status": "online", "shop": self._shop_row()}
 
+    def has_live_connection(self) -> bool:
+        """本进程是否仍持有该店铺的活连接（stale cleanup 的豁免判定）。"""
+        with self.lock:
+            return isinstance(self.listener, dict) and bool(self.listener.get("client"))
+
     def offline(self) -> None:
         with self.lock:
             self._disconnect_customer_service(update_session=True)
