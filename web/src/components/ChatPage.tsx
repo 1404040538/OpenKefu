@@ -152,16 +152,14 @@ export function ChatPage({ shops, activeShop, shopFilter, conversations, selecte
             }).catch(() => undefined);
           }}>
             <input className="input" disabled={!canSend || replyPending || imageReplyPending} value={text} onChange={(e) => setText(e.target.value)} placeholder={sendPlaceholder} />
-            {selectedShop?.platform !== "qianniu" && (
-              <label className={`btn btn-ghost btn-icon chat-image-send ${!canSend || replyPending || imageReplyPending ? "disabled" : ""}`} title={imageReplyPending ? "图片发送中" : "发送图片"}>
-                {imageReplyPending ? <Loader2 className="spin" size={16} /> : <ImageIcon size={16} />}
-                <input type="file" accept="image/*" disabled={!canSend || replyPending || imageReplyPending} onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  event.currentTarget.value = "";
-                  handleImageFile(file).catch((error) => alert(String(error)));
-                }} />
-              </label>
-            )}
+            <label className={`btn btn-ghost btn-icon chat-image-send ${!canSend || replyPending || imageReplyPending ? "disabled" : ""}`} title={imageReplyPending ? "图片发送中" : "发送图片"}>
+              {imageReplyPending ? <Loader2 className="spin" size={16} /> : <ImageIcon size={16} />}
+              <input type="file" accept="image/*" disabled={!canSend || replyPending || imageReplyPending} onChange={(event) => {
+                const file = event.target.files?.[0];
+                event.currentTarget.value = "";
+                handleImageFile(file).catch((error) => alert(String(error)));
+              }} />
+            </label>
             <button className="btn btn-primary" disabled={!canSend || replyPending || imageReplyPending || !text.trim()}>
               {replyPending ? <Loader2 className="spin" size={16} /> : <Send size={16} />}
               {replyPending ? "发送中" : null}

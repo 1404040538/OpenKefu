@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import threading
@@ -35,6 +36,19 @@ from openkefu.web.db import Database, json_dumps
 from openkefu.web.realtime import RealtimeHub, RuntimeLogger
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_biz_data_ext(message: ImpaasMessage) -> dict:
+    """从消息原始模型提取 bizDataExt（浏览上下文卡片携带 enter_shop_info）。"""
+    msg = (message.raw or {}).get("message") or {}
+    ext = msg.get("extension") or {}
+    value = ext.get("bizDataExt")
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+    return value if isinstance(value, dict) else {}
 
 
 class QianniuShopRunner:
@@ -164,12 +178,86 @@ class QianniuShopRunner:
                 time.sleep(1)
         raise RuntimeError(f"发送失败: {last_error}")
 
+    def send_image(self, *, conversation_id: int, image_base64: str) -> dict[str, Any]:
+        """web 端发送图片（runtime_call 兼容签名，对齐 PDD ShopRunner 流程）。"""
+        conversation = self.repos.conversations.by_id_plain(conversation_id)
+        if not conversation or int(conversation.get("shop_id") or 0) != self.shop_id:
+            raise RuntimeError("会话不存在或不属于当前店铺")
+        if not self.im_client or self.im_client.status != "online":
+            raise RuntimeError("shop is not online")
+        cid = str(conversation.get("conv_id") or "")
+        peer = self._peer_uid(cid)
+        if not cid or not peer:
+            raise RuntimeError("会话缺少千牛 cid 信息，无法发送")
+
+        raw = image_base64.strip()
+        if "," in raw and raw.startswith("data:image/"):
+            raw = raw.split(",", 1)[1]
+        try:
+            image_bytes = base64.b64decode(raw)
+        except Exception as exc:
+            raise RuntimeError("invalid image data") from exc
+        if not image_bytes:
+            raise RuntimeError("invalid image data")
+
+        user_uid = str(conversation.get("user_uid") or "")
+        message_id = self.repos.conversations.insert_chat_message({
+            "shop_id": self.shop_id,
+            "conversation_id": conversation_id,
+            "direction": "outbound",
+            "msg_id": "",
+            "client_msg_id": "",
+            "user_uid": user_uid,
+            "sender_role": "service",
+            "message_type": 1,
+            "kind": "image",
+            "content": "[图片]",
+            "goods_json": None,
+            "size_json": None,
+            "raw_json": None,
+            "message_at": int(time.time() * 1000),
+        })
+        try:
+            result, image_url = self.im_client.send_image(cid, peer, image_bytes)
+        except Exception as exc:
+            self.repos.conversations.update_message(message_id, {"status": "failed", "error": str(exc)})
+            self.runtime_logger.log("ERROR", __name__, "qianniu.image",
+                                    f"image send failed: {exc}", shop_id=self.shop_id,
+                                    context={"cid": cid})
+            self.hub.publish({"type": "reply_result", "data": {
+                "id": message_id, "shop_id": self.shop_id, "status": "failed", "error": "图片发送失败"}})
+            raise
+        self.repos.conversations.update_message(message_id, {
+            "msg_id": str(result.get("messageId") or ""),
+            "status": "sent", "content": image_url,
+            "raw_json": json_dumps(result)})
+        self.hub.publish({"type": "reply_result", "data": {
+            "id": message_id, "shop_id": self.shop_id, "status": "success", "result": result}})
+        self.runtime_logger.log("INFO", __name__, "qianniu.image", "image sent",
+                                shop_id=self.shop_id, context={"cid": cid})
+        return {"success": True, "message_id": result.get("messageId"), "url": image_url}
+
     def online(self) -> dict[str, Any]:
         row = self._shop_row()
         if self.im_client and self.im_client.status == "online":
             return {"status": "online", "shop": row}
         self._connect_from_cache()
+        # 连接是后台线程建立的：等待终态（online / stop / 缓存缺失），
+        # 避免立即返回 "closed" 造成"上线没生效"的误判
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            client = self.im_client
+            if client is None or client._stop.is_set():
+                break
+            if client.status == "online":
+                break
+            time.sleep(0.5)
         return {"status": self.im_client.status if self.im_client else "offline", "shop": row}
+
+    def has_live_connection(self) -> bool:
+        """本进程是否仍持有该店铺的活连接（stale cleanup 的豁免判定）。"""
+        with self.lock:
+            return self.im_client is not None
 
     def offline(self) -> None:
         self._disconnect(update_session=True, session_status="offline")
@@ -284,15 +372,86 @@ class QianniuShopRunner:
                 on_status=self._on_im_status,
             )
             self.im_client.start()
-        self.repos.shops.mark_online(self.shop_id, mall_id=self.mall_id or "",
-                                     nickname=self.nick)
+        # 店铺状态在 im 真正 online 时才回写（_on_im_status），
+        # 这里只标 connecting——避免连接尚未建立/失败时 DB 已假在线
+        self._set_shop_status("connecting")
         self.hub.publish({"type": "shop_status", "data": self._shop_row()})
 
     def _on_im_status(self, status: str, detail: Any) -> None:
-        self.hub.publish({"type": "shop_status", "data": self._shop_row()})
-        if status == "error":
+        if status == "online":
+            try:
+                self.repos.shops.mark_online(self.shop_id, mall_id=self.mall_id or "",
+                                             nickname=self.nick)
+            except Exception:
+                logger.exception("qianniu mark_online failed")
+            # 上线补拉掉线窗口消息（独立线程：回调可能在收帧线程，勿同步 RPC 自锁）
+            if self.im_client:
+                threading.Thread(target=self._backfill_recent_conversations,
+                                 name=f"qianniu-backfill-{self.shop_id}", daemon=True).start()
+        elif status == "error":
             self.runtime_logger.log("WARNING", __name__, "qianniu.im", f"im status={status} {detail}",
                                     shop_id=self.shop_id)
+        self.hub.publish({"type": "shop_status", "data": self._shop_row()})
+
+    def _backfill_recent_conversations(self) -> None:
+        """重连/进程重启后补拉掉线窗口的消息（只入库与推送事件，不触发自动回复）。
+
+        impaas 客户端为防历史回放，只放行晚于进程启动时间的消息——
+        跨进程的掉线窗口因此成为盲区。这里按 DB 已知水位
+        （会话最新 message_at）补拉近期活跃会话。
+        """
+        client = self.im_client
+        if not client:
+            return
+        try:
+            rows = self.db.query(
+                """
+                SELECT c.id AS conversation_id, c.conv_id,
+                       MAX(m.message_at) AS last_at
+                FROM conversations c
+                LEFT JOIN messages m ON m.conversation_id = c.id
+                WHERE c.shop_id=%s AND c.chat_type='qianniu_kefu'
+                  AND c.conv_id IS NOT NULL AND c.conv_id <> ''
+                GROUP BY c.id, c.conv_id
+                ORDER BY last_at DESC
+                LIMIT 10
+                """,
+                (self.shop_id,),
+            )
+        except Exception:
+            logger.exception("qianniu backfill query failed")
+            return
+        backfilled = 0
+        for row in rows:
+            cid = str(row.get("conv_id") or "")
+            last_at = int(row.get("last_at") or 0)
+            if not cid or not self.im_client:
+                break
+            try:
+                messages = client.list_messages(cid, count=10)
+            except Exception:
+                logger.exception("qianniu backfill list_messages failed cid=%s", cid)
+                continue
+            for message in messages:
+                if message.create_at <= last_at:
+                    continue
+                conversation_id = self._store_message(message)
+                backfilled += 1
+                self.hub.publish({"type": "qianniu_message", "data": {
+                    "shop_id": self.shop_id,
+                    "conversation_id": conversation_id,
+                    "cid": message.cid,
+                    "sender_uid": message.sender_uid_num,
+                    "text": message.text,
+                    "kind": message.kind,
+                    "content_type": message.content_type,
+                    "message_id": message.message_id,
+                    "create_at": message.create_at,
+                }})
+        if backfilled:
+            self.runtime_logger.log("INFO", __name__, "qianniu.backfill",
+                                    "backfilled offline-window messages",
+                                    shop_id=self.shop_id, context={"count": backfilled})
 
     def _on_messages(self, messages: list[ImpaasMessage]) -> None:
         for message in messages:
@@ -304,14 +463,15 @@ class QianniuShopRunner:
                 "cid": message.cid,
                 "sender_uid": message.sender_uid_num,
                 "text": message.text,
+                "kind": message.kind,
                 "content_type": message.content_type,
                 "message_id": message.message_id,
                 "create_at": message.create_at,
             }})
         self.runtime_logger.log("INFO", __name__, "qianniu.message", "messages received",
                                 shop_id=self.shop_id, context={"count": len(messages)})
-        # 卡片消息（contentType 101）是浏览上下文，不触发自动回复
-        text_messages = [m for m in messages if m.content_type == 1]
+        # 卡片（浏览上下文等）不触发自动回复；图片消息只入库
+        text_messages = [m for m in messages if m.kind == "text" and m.content_type == 1]
         if not (text_messages and self._auto_reply_enabled() and self.im_client):
             return
         for message in text_messages:
@@ -420,7 +580,7 @@ class QianniuShopRunner:
             return []
         rows = self.db.query(
             """
-            SELECT direction, content FROM messages
+            SELECT direction, kind, content FROM messages
             WHERE conversation_id=%s AND direction IN ('inbound','outbound')
             ORDER BY id DESC LIMIT 10
             """,
@@ -429,6 +589,9 @@ class QianniuShopRunner:
         history = []
         for row in reversed(rows):
             content = str(row.get("content") or "").strip()
+            if row.get("kind") == "image":
+                # 图片 content 是 URL，对 LLM 用占位描述（对齐 PDD 口径）
+                content = "[顾客发送了一张图片]"
             if not content:
                 continue
             role = "assistant" if row.get("direction") == "outbound" else "user"
@@ -459,7 +622,8 @@ class QianniuShopRunner:
             logger.exception("qianniu existing_message_row failed")
 
         user_uid = self._peer_uid(message.cid) or message.sender_uid_num
-        is_card = message.content_type != 1
+        is_card = message.kind == "card"
+        is_image = message.kind == "image"
         mall_id = self.mall_id or None
         params = {
             "shop_id": self.shop_id,
@@ -496,18 +660,75 @@ class QianniuShopRunner:
                 "user_uid": user_uid,
                 "sender_role": "system" if is_card else "user",
                 "message_type": message.content_type,
-                "kind": "card" if is_card else "text",
-                "content": message.text or "",
+                "kind": message.kind if message.kind in ("text", "image") else "card",
+                "content": message.image_url if is_image else (message.text or ""),
                 "goods_json": None,
-                "size_json": None,
+                "size_json": json_dumps(message.image_info) if is_image else None,
                 "raw_json": json_dumps({"cid": message.cid, "sender": message.sender_uid,
                                         "contentType": message.content_type,
-                                        "createAt": message.create_at}),
+                                        "createAt": message.create_at,
+                                        "bizDataExt": _extract_biz_data_ext(message)}),
                 "message_at": message.create_at or int(time.time() * 1000),
             })
         except IntegrityError:
             pass  # 并发重复推送，幂等
         return conversation_id
+
+    def conversation_context(self, conversation_id: int) -> dict[str, Any]:
+        """会话上下文面板（对齐 PDD ShopRunner 返回结构）。
+
+        订单查询依赖的 mtop 商家侧接口尚未逆向，先返回 unavailable；
+        商品卡片从买家浏览上下文（bizDataExt.enter_shop_info）提取。
+        """
+        conversation = self.repos.conversations.by_id_plain(conversation_id)
+        if not conversation:
+            raise ValueError(f"conversation not found: {conversation_id}")
+        if int(conversation.get("shop_id") or 0) != self.shop_id:
+            raise ValueError(f"conversation does not belong to shop: {conversation_id}")
+
+        goods: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        rows = self.db.query(
+            """
+            SELECT id, message_at, raw_json FROM messages
+            WHERE conversation_id=%s AND direction='system'
+            ORDER BY id DESC LIMIT 80
+            """,
+            (conversation_id,),
+        )
+        for row in rows:
+            try:
+                raw = json.loads(row.get("raw_json") or "{}")
+            except (TypeError, ValueError):
+                continue
+            info = ((raw.get("bizDataExt") or {}).get("extraParams") or {}).get("enter_shop_info")
+            if not info:
+                continue
+            try:
+                info = json.loads(info) if isinstance(info, str) else info
+            except (TypeError, ValueError):
+                continue
+            goods_id = str(info.get("itemId") or "")
+            if not goods_id or goods_id in seen:
+                continue
+            seen.add(goods_id)
+            goods.append({
+                "goods_id": goods_id,
+                "title": info.get("title") or (info.get("pageSource") == "GOODS_DETAIL" and "商品详情页进线" or "浏览商品"),
+                "thumb_url": info.get("picUrl") or "",
+                "shop_id": info.get("shopId") or "",
+                "source": "browse_context",
+                "message_id": row.get("id"),
+                "message_at": row.get("message_at"),
+            })
+        return {
+            "conversation_id": conversation_id,
+            "user_uid": str(conversation.get("user_uid") or ""),
+            "recent_goods": goods[:5],
+            "orders": [],
+            "orders_status": "unavailable",
+            "orders_message": "千牛订单查询接口待接入，暂时无法查询订单记录。",
+        }
 
     def _store_outbound_message(self, source: ImpaasMessage, msg_id: str, content: str) -> None:
         """自动回复入库（direction=outbound，对齐人工回复约定）。"""

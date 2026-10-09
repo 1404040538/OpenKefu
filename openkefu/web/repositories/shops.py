@@ -330,6 +330,22 @@ class ShopsRepository:
     def lease_row(self, shop_id: int) -> dict[str, Any] | None:
         return self.db.query_one("SELECT * FROM shop_runtime_leases WHERE shop_id=%s", (shop_id,))
 
+    def lease_remaining_seconds(self, shop_id: int) -> float | None:
+        """当前租约距过期的秒数；无租约返回 None，已过期返回 0。"""
+        row = self.db.query_one(
+            "SELECT expires_at, status FROM shop_runtime_leases WHERE shop_id=%s",
+            (shop_id,),
+        )
+        if not row:
+            return None
+        if str(row.get("status") or "") != "online":
+            return 0
+        expires_at = row.get("expires_at")
+        if not expires_at:
+            return 0
+        remaining = (expires_at - datetime.now()).total_seconds()
+        return max(0.0, remaining)
+
     def runtime_workers(self) -> list[dict[str, Any]]:
         return self.db.query(
             """
@@ -483,6 +499,23 @@ class ShopsRepository:
             """,
             (worker_id, grace_seconds),
         )
+
+    def has_pending_takeover_candidates(self, *, worker_id: str, grace_seconds: int) -> bool:
+        """是否存在仍处他人租约保护期内的 online 店铺（恢复线程据此继续等待）。"""
+        return self.db.query_one(
+            """
+            SELECT 1
+            FROM shops s
+            JOIN shop_login_caches c ON c.shop_id=s.id
+            JOIN shop_runtime_leases l ON l.shop_id=s.id
+            WHERE s.status IN ('online','connecting')
+              AND l.status='online'
+              AND l.worker_id<>%s
+              AND l.expires_at>=DATE_SUB(NOW(), INTERVAL %s SECOND)
+            LIMIT 1
+            """,
+            (worker_id, grace_seconds),
+        ) is not None
 
     def non_reconnectable_online_shop_ids(self, *, worker_id: str, grace_seconds: int) -> list[int]:
         rows = self.db.query(

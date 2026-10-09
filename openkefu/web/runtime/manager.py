@@ -52,7 +52,10 @@ from openkefu.web.runtime.shop_runner import PasswordVerificationRequired, ShopR
 
 
 class ShopRuntimeManager:
-    STARTUP_RECONNECT_GRACE_SECONDS = 300
+    STARTUP_RECONNECT_GRACE_SECONDS = 15
+    # recovery 接管缓冲：必须远小于 stale cleanup 的 grace，
+    # 保证崩溃店铺先被 recovery 接管而不是被标 offline
+    STARTUP_TAKEOVER_BUFFER_SECONDS = 2
 
     def __init__(self, db: Database, hub: RealtimeHub, runtime_logger: RuntimeLogger, config: AppConfig):
         self.db = db
@@ -72,6 +75,8 @@ class ShopRuntimeManager:
         self._startup_reconnect_thread: threading.Thread | None = None
         self._stale_cleanup_thread: threading.Thread | None = None
         self._data_cleanup_thread: threading.Thread | None = None
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_done = False
         self.reply_executor = ThreadPoolExecutor(
             max_workers=config.runtime.reply_workers,
             thread_name_prefix="reply-worker",
@@ -168,26 +173,107 @@ class ShopRuntimeManager:
         return self.runner(shop_id).online()
 
     def offline_shop(self, shop_id: int) -> None:
-        self.runner(shop_id).offline()
-        self.release_shop_lease(shop_id, status="offline")
+        try:
+            self.runner(shop_id).offline()
+        finally:
+            self.release_shop_lease(shop_id, status="offline")
 
     def stop_shop(self, shop_id: int) -> None:
-        self.runner(shop_id).stop()
-        self.release_shop_lease(shop_id, status="stopped")
+        # runner 停止失败也必须释放租约——否则遗留 online 租约
+        # 会拖住下一次接管一个完整 TTL 周期
+        try:
+            self.runner(shop_id).stop()
+        finally:
+            self.release_shop_lease(shop_id, status="stopped")
 
-    def acquire_shop_lease(self, shop_id: int, *, required: bool = False) -> bool:
+    def acquire_shop_lease(self, shop_id: int, *, required: bool = False,
+                           wait_seconds: float = 95.0) -> bool:
+        """获取店铺运行租约；被其他存活 worker 持有时等待其过期后重试。
+
+        wait_seconds：旧租约未过期时的最长等待（默认覆盖一个完整
+        lease TTL 周期）。等待期间每 3 秒重试一次；超时仍失败时，
+        required=True 抛错、False 返回 False。
+        """
         shop_id = int(shop_id)
-        acquired = self.repos.shops.acquire_lease(
-            shop_id,
-            worker_id=self.worker_id,
-            pid=os.getpid(),
-            ttl_seconds=int(self.config.runtime.lease_ttl_seconds),
-            required=required,
-        )
-        if acquired:
+        deadline = time.monotonic() + max(0.0, wait_seconds)
+        while True:
+            acquired = self.repos.shops.acquire_lease(
+                shop_id,
+                worker_id=self.worker_id,
+                pid=os.getpid(),
+                ttl_seconds=int(self.config.runtime.lease_ttl_seconds),
+                required=False,
+            )
+            if acquired:
+                with self._lock:
+                    self._owned_shop_ids.add(shop_id)
+                return True
+            if not required:
+                return False
+            remaining = self.repos.shops.lease_remaining_seconds(shop_id)
+            if remaining is None or remaining <= 0:
+                # 无租约或已过期却仍获取失败（如恰好被并发抢占），短暂等待后重试
+                remaining = 3.0
+            if time.monotonic() + remaining > deadline:
+                row = self.repos.shops.lease_row(shop_id) or {}
+                raise RuntimeError(
+                    f"店铺运行锁被其他实例持有（worker={row.get('worker_id') or '?'}），"
+                    f"其租约约 {int(remaining)} 秒后过期；请稍后重试"
+                )
+            self.runtime_logger.log(
+                "INFO",
+                __name__,
+                "runtime.lease.wait",
+                "waiting for previous worker lease to expire",
+                shop_id=shop_id,
+                context={"remaining_seconds": int(remaining), "worker_id": self.worker_id},
+            )
+            time.sleep(min(remaining + 1.0, 5.0))
+
+    def shutdown(self) -> None:
+        """优雅退出：停止所有 runner、释放租约、标记店铺下线。
+
+        以 _owned_shop_ids（租约权威集合）为准——acquire 过但尚未创建
+        runner 的店铺也要释放。由 web lifespan 的 finally 调用；
+        kill -9 场景无法触达，依赖 lease TTL 自然过期 + stale cleanup 纠正。
+        """
+        with self._shutdown_lock:
+            if self._shutdown_done:
+                return  # lifespan 与 atexit 双路径都会调用，幂等短路
+            self._shutdown_done = True
             with self._lock:
-                self._owned_shop_ids.add(shop_id)
-        return acquired
+                shop_ids = list(self._owned_shop_ids)
+                known_runners = list(self._runners.keys())
+            for shop_id in shop_ids:
+                try:
+                    if shop_id in known_runners:
+                        self.stop_shop(shop_id)
+                    else:
+                        # 持有租约但没有 runner（如刚 acquire 完成还没上线）：
+                        # 直接释放并纠正店铺状态
+                        self.release_shop_lease(shop_id, status="offline")
+                        try:
+                            self.repos.shops.mark_shop_offline_with_error(
+                                shop_id, "runtime worker shutting down")
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    self.runtime_logger.log(
+                        "ERROR",
+                        __name__,
+                        "runtime.shutdown.runner",
+                        "failed to stop runner during shutdown",
+                        shop_id=shop_id,
+                        error=exc,
+                    )
+            self.stop_background_services()
+            self.runtime_logger.log(
+                "INFO",
+                __name__,
+                "runtime.shutdown",
+                "runtime manager shut down",
+                context={"worker_id": self.worker_id, "leased_shops": len(shop_ids)},
+            )
 
     def release_shop_lease(self, shop_id: int, *, status: str) -> None:
         shop_id = int(shop_id)
@@ -262,55 +348,57 @@ class ShopRuntimeManager:
         self.reply_executor.shutdown(wait=False, cancel_futures=True)
 
     def recover_restart_online_shops(self) -> None:
-        candidates = self._startup_reconnect_candidates()
-        candidate_ids = [int(row["id"]) for row in candidates]
-        stale_shop_ids = self._cleanup_non_reconnectable_startup_state(candidate_ids)
+        # 崩溃残留的租约可能在本进程启动后才过期（TTL 未走完），
+        # 一次性扫描会扑空——在接管窗口内循环重扫，直到无候选
+        grace = self._startup_reconnect_grace_seconds()
+        ttl = int(self.config.runtime.lease_ttl_seconds)
+        window = grace + ttl + 30
+        deadline = time.monotonic() + window
+        handled: set[int] = set()
+        while not self._stop_event.is_set():
+            candidates = self._startup_reconnect_candidates()
+            pending = [int(row["id"]) for row in candidates if int(row["id"]) not in handled]
+            for shop_id in pending:
+                if self._stop_event.is_set():
+                    return
+                self._auto_reconnect_shop_after_restart(shop_id)
+                handled.add(shop_id)
+                self._stop_event.wait(1)
+            if time.monotonic() >= deadline:
+                break
+            # 还有"仍在租约保护期内的 online 店铺"时继续等它过期
+            if not self.repos.shops.has_pending_takeover_candidates(
+                    worker_id=self.worker_id,
+                    grace_seconds=self.STARTUP_TAKEOVER_BUFFER_SECONDS):
+                break
+            self._stop_event.wait(10)
         self.runtime_logger.log(
             "INFO",
             __name__,
             "runtime.startup_recovery",
-            "startup runtime recovery planned",
+            "startup runtime recovery finished",
             context={
                 "worker_id": self.worker_id,
-                "reconnect_shop_ids": candidate_ids,
-                "stale_shop_ids": stale_shop_ids,
+                "reconnected": sorted(handled),
+                "window_seconds": window,
             },
         )
-        for shop_id in candidate_ids:
-            if self._stop_event.is_set():
-                return
-            self._auto_reconnect_shop_after_restart(shop_id)
-            self._stop_event.wait(1)
 
     def _startup_reconnect_grace_seconds(self) -> int:
+        # grace = 租约过期后的额外接管缓冲（防时钟偏差/续租边缘竞态），
+        # 总接管等待 ≈ lease TTL + grace。原子性由 claim SQL 的
+        # UPDATE ... WHERE expires_at<... 保证，多 worker 并发只有一个成功。
         ttl = int(self.config.runtime.lease_ttl_seconds)
-        return max(self.STARTUP_RECONNECT_GRACE_SECONDS, ttl * 3)
+        return max(self.STARTUP_RECONNECT_GRACE_SECONDS, ttl // 4)
 
     def _startup_reconnect_candidates(self) -> list[dict[str, Any]]:
+        # 接管缓冲远小于 stale cleanup 的 grace（15s）：recovery 必须先于
+        # stale 动手，否则店铺被标 offline 后就失去恢复资格；多 worker
+        # 竞态由 claim SQL 的 UPDATE WHERE 原子性保证，缓冲不是正确性依赖
         return self.repos.shops.startup_reconnect_candidates(
             worker_id=self.worker_id,
-            grace_seconds=self._startup_reconnect_grace_seconds(),
+            grace_seconds=self.STARTUP_TAKEOVER_BUFFER_SECONDS,
         )
-
-    def _cleanup_non_reconnectable_startup_state(self, reconnect_shop_ids: list[int]) -> list[int]:
-        stale_ids = self.repos.shops.non_reconnectable_online_shop_ids(
-            worker_id=self.worker_id,
-            grace_seconds=self._startup_reconnect_grace_seconds(),
-        )
-        stale_shop_ids = [shop_id for shop_id in stale_ids if shop_id not in set(reconnect_shop_ids)]
-        if not stale_shop_ids:
-            return []
-
-        self.repos.shops.bulk_mark_sessions_offline(
-            stale_shop_ids, error='runtime worker restarted; reconnect not eligible',
-        )
-        self.repos.shops.bulk_mark_shops_offline(stale_shop_ids)
-        self.repos.shops.bulk_release_stale_leases(stale_shop_ids, worker_id=self.worker_id)
-        for shop_id in stale_shop_ids:
-            shop = self.repos.shops.row_with_cache(shop_id)
-            if shop:
-                self.hub.publish({"type": "shop_status", "data": shop})
-        return stale_shop_ids
 
     def _claim_startup_reconnect_lease(self, shop_id: int) -> bool:
         expires_at = datetime.now() + timedelta(seconds=int(self.config.runtime.lease_ttl_seconds))
@@ -319,7 +407,7 @@ class ShopRuntimeManager:
             worker_id=self.worker_id,
             pid=os.getpid(),
             expires_at=expires_at,
-            grace_seconds=self._startup_reconnect_grace_seconds(),
+            grace_seconds=self.STARTUP_TAKEOVER_BUFFER_SECONDS,
         )
         if not updated:
             return False
@@ -346,6 +434,18 @@ class ShopRuntimeManager:
             return
 
         runner = self.runner(shop_id)
+        # 手动上线可能在本线程等待期间抢先接管——已持有活连接时
+        # 不得重连（千牛同账号重连会断开刚建立的会话）
+        if runner.has_live_connection():
+            self.runtime_logger.log(
+                "INFO",
+                __name__,
+                "runtime.startup_reconnect.skip",
+                "shop already connected by manual online, skip reconnect",
+                shop_id=shop_id,
+                context={"worker_id": self.worker_id},
+            )
+            return
         try:
             runner._set_shop_status("connecting")
             self.hub.publish({"type": "shop_status", "data": runner._shop_row()})
@@ -490,8 +590,10 @@ class ShopRuntimeManager:
             for shop_id in stale_shop_ids:
                 with self._lock:
                     runner = self._runners.get(shop_id)
-                if runner is not None and isinstance(runner.listener, dict) and runner.listener.get("client"):
-                    # 本进程正在运行该店铺的 WS，跳过
+                # 本进程 runner 仍持有活连接时跳过（平台无关判定：
+                # 心跳抖动不应把真在线的店铺误杀——那会留下 DB 已下线
+                # 但 WS 仍在跑的双连接隐患）
+                if runner is not None and getattr(runner, "has_live_connection", lambda: False)():
                     continue
                 try:
                     self.repos.shops.mark_shop_offline_with_error(
