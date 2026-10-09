@@ -70,6 +70,11 @@ def create_app() -> FastAPI:
             ctx.offline_pool.shutdown(wait=False)
             await hub.stop()
 
+    # 兜底：关闭终端窗口（CTRL_CLOSE 只有 ~5s）等 lifespan 来不及走完的
+    # 场景，atexit 尽力释放租约与断开长连接；与 lifespan 幂等共存
+    import atexit
+    atexit.register(runtime.shutdown)
+
     app = FastAPI(title="OpenKefu Web", version="0.1.0", lifespan=lifespan)
     app.state.config = config
     app.state.db = db

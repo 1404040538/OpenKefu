@@ -76,6 +76,7 @@ class ShopRuntimeManager:
         self._stale_cleanup_thread: threading.Thread | None = None
         self._data_cleanup_thread: threading.Thread | None = None
         self._shutdown_lock = threading.Lock()
+        self._shutdown_done = False
         self.reply_executor = ThreadPoolExecutor(
             max_workers=config.runtime.reply_workers,
             thread_name_prefix="reply-worker",
@@ -237,6 +238,9 @@ class ShopRuntimeManager:
         kill -9 场景无法触达，依赖 lease TTL 自然过期 + stale cleanup 纠正。
         """
         with self._shutdown_lock:
+            if self._shutdown_done:
+                return  # lifespan 与 atexit 双路径都会调用，幂等短路
+            self._shutdown_done = True
             with self._lock:
                 shop_ids = list(self._owned_shop_ids)
                 known_runners = list(self._runners.keys())

@@ -222,8 +222,8 @@ class RealtimeHub:
                 return
             except Exception:
                 logger.exception("failed to publish realtime event to redis")
-        if not self.loop:
-            logger.debug("realtime hub has no loop yet: %s", event)
+        if not self.loop or self.loop.is_closed():
+            logger.debug("realtime hub loop unavailable, drop event: %s", event)
             return
         asyncio.run_coroutine_threadsafe(self.broadcast(event), self.loop)
 
