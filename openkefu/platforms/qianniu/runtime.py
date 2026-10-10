@@ -152,7 +152,7 @@ class QianniuShopRunner:
         for _ in range(max(1, send_attempts)):
             try:
                 result = self.im_client.send_text(cid, peer, content)
-                self.repos.conversations.insert_chat_message({
+                message_id = self.repos.conversations.insert_chat_message({
                     "shop_id": self.shop_id,
                     "conversation_id": conversation_id,
                     "direction": "outbound",
@@ -167,11 +167,9 @@ class QianniuShopRunner:
                     "size_json": None,
                     "raw_json": None,
                     "message_at": int(time.time() * 1000),
+                    "status": "sent",
                 })
-                self.hub.publish({"type": "message_sent", "data": {
-                    "shop_id": self.shop_id, "conversation_id": conversation_id,
-                    "content": content[:200],
-                }})
+                self._publish_message_and_conversation(message_id, conversation_id)
                 return {"success": True, "message_id": result.get("messageId")}
             except Exception as exc:
                 last_error = exc
@@ -216,6 +214,7 @@ class QianniuShopRunner:
             "size_json": None,
             "raw_json": None,
             "message_at": int(time.time() * 1000),
+            "status": "sending",
         })
         try:
             result, image_url = self.im_client.send_image(cid, peer, image_bytes)
@@ -226,11 +225,15 @@ class QianniuShopRunner:
                                     context={"cid": cid})
             self.hub.publish({"type": "reply_result", "data": {
                 "id": message_id, "shop_id": self.shop_id, "status": "failed", "error": "图片发送失败"}})
+            failed_row = self.repos.conversations.row_by_id("messages", message_id)
+            if failed_row:
+                self.hub.publish({"type": "message", "data": failed_row})
             raise
         self.repos.conversations.update_message(message_id, {
             "msg_id": str(result.get("messageId") or ""),
             "status": "sent", "content": image_url,
             "raw_json": json_dumps(result)})
+        self._publish_message_and_conversation(message_id, conversation_id)
         self.hub.publish({"type": "reply_result", "data": {
             "id": message_id, "shop_id": self.shop_id, "status": "success", "result": result}})
         self.runtime_logger.log("INFO", __name__, "qianniu.image", "image sent",
@@ -435,19 +438,9 @@ class QianniuShopRunner:
             for message in messages:
                 if message.create_at <= last_at:
                     continue
-                conversation_id = self._store_message(message)
+                conversation_id, message_id = self._store_message(message)
                 backfilled += 1
-                self.hub.publish({"type": "qianniu_message", "data": {
-                    "shop_id": self.shop_id,
-                    "conversation_id": conversation_id,
-                    "cid": message.cid,
-                    "sender_uid": message.sender_uid_num,
-                    "text": message.text,
-                    "kind": message.kind,
-                    "content_type": message.content_type,
-                    "message_id": message.message_id,
-                    "create_at": message.create_at,
-                }})
+                self._publish_message_and_conversation(message_id, conversation_id)
         if backfilled:
             self.runtime_logger.log("INFO", __name__, "qianniu.backfill",
                                     "backfilled offline-window messages",
@@ -455,19 +448,10 @@ class QianniuShopRunner:
 
     def _on_messages(self, messages: list[ImpaasMessage]) -> None:
         for message in messages:
-            # 入库（幂等：msg_id 唯一）
-            conversation_id = self._store_message(message)
-            self.hub.publish({"type": "qianniu_message", "data": {
-                "shop_id": self.shop_id,
-                "conversation_id": conversation_id,
-                "cid": message.cid,
-                "sender_uid": message.sender_uid_num,
-                "text": message.text,
-                "kind": message.kind,
-                "content_type": message.content_type,
-                "message_id": message.message_id,
-                "create_at": message.create_at,
-            }})
+            # 入库（幂等：msg_id 唯一）并推送标准 message/conversation 事件，
+            # 前端 WS 据此实时更新会话列表与消息流（与 PDD 链路一致）
+            conversation_id, message_id = self._store_message(message)
+            self._publish_message_and_conversation(message_id, conversation_id)
         self.runtime_logger.log("INFO", __name__, "qianniu.message", "messages received",
                                 shop_id=self.shop_id, context={"count": len(messages)})
         # 卡片（浏览上下文等）不触发自动回复；图片消息只入库
@@ -611,13 +595,13 @@ class QianniuShopRunner:
 
     # ---------- 消息持久化（沿用 conversations/messages 表约定） ----------
 
-    def _store_message(self, message: ImpaasMessage) -> int:
-        """买家消息入库（幂等），返回 conversation_id。"""
+    def _store_message(self, message: ImpaasMessage) -> tuple[int, int | None]:
+        """买家消息入库（幂等），返回 (conversation_id, message_id)。"""
         try:
             existing = self.repos.conversations.existing_message_row(
                 self.shop_id, msg_id=message.message_id or None)
             if existing:
-                return int(existing.get("conversation_id") or 0)
+                return int(existing.get("conversation_id") or 0), int(existing.get("id") or 0) or None
         except Exception:
             logger.exception("qianniu existing_message_row failed")
 
@@ -650,8 +634,9 @@ class QianniuShopRunner:
                 raise
             conversation_id = int(conversation["id"])
 
+        message_id: int | None = None
         try:
-            self.repos.conversations.insert_chat_message({
+            message_id = self.repos.conversations.insert_chat_message({
                 "shop_id": self.shop_id,
                 "conversation_id": conversation_id,
                 "direction": "system" if is_card else "inbound",
@@ -672,7 +657,19 @@ class QianniuShopRunner:
             })
         except IntegrityError:
             pass  # 并发重复推送，幂等
-        return conversation_id
+        return conversation_id, message_id
+
+    def _publish_message_and_conversation(self, message_id: int | None, conversation_id: int) -> None:
+        """推送前端 WS 消费的标准事件（与 PDD 链路一致：前端只认 message/conversation）。"""
+        if message_id:
+            row = self.repos.conversations.row_by_id("messages", int(message_id))
+            # 与 REST messages_page 的过滤保持一致：空文本的 system(card) 行不进消息流，
+            # 否则实时出现、刷新后消失
+            if row and not (row.get("direction") == "system" and not str(row.get("content") or "")):
+                self.hub.publish({"type": "message", "data": row})
+        conversation = self.repos.conversations.row(int(conversation_id))
+        if conversation:
+            self.hub.publish({"type": "conversation", "data": conversation})
 
     def conversation_context(self, conversation_id: int) -> dict[str, Any]:
         """会话上下文面板（对齐 PDD ShopRunner 返回结构）。
@@ -731,15 +728,16 @@ class QianniuShopRunner:
         }
 
     def _store_outbound_message(self, source: ImpaasMessage, msg_id: str, content: str) -> None:
-        """自动回复入库（direction=outbound，对齐人工回复约定）。"""
+        """自动回复入库（direction=outbound，对齐人工回复约定）并推送标准事件。"""
         try:
             conversation = self.repos.conversations.by_shop_uid_mall(
                 self.shop_id, self._peer_uid(source.cid) or "", self.mall_id or None)
             if not conversation:
                 return
-            self.repos.conversations.insert_chat_message({
+            conversation_id = int(conversation["id"])
+            message_id = self.repos.conversations.insert_chat_message({
                 "shop_id": self.shop_id,
-                "conversation_id": int(conversation["id"]),
+                "conversation_id": conversation_id,
                 "direction": "outbound",
                 "msg_id": msg_id,
                 "client_msg_id": "",
@@ -752,7 +750,9 @@ class QianniuShopRunner:
                 "size_json": None,
                 "raw_json": None,
                 "message_at": int(time.time() * 1000),
+                "status": "sent",
             })
+            self._publish_message_and_conversation(message_id, conversation_id)
         except Exception:
             logger.exception("qianniu store outbound failed")
 

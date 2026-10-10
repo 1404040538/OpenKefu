@@ -309,14 +309,15 @@ class ConversationsRepository:
             """
             INSERT INTO messages
             (shop_id, conversation_id, direction, msg_id, client_msg_id, user_uid,
-             sender_role, message_type, kind, content, goods_json, size_json, raw_json, message_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+             sender_role, message_type, kind, content, goods_json, size_json, raw_json, message_at, status)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             [
                 params["shop_id"], params["conversation_id"], params["direction"],
                 params["msg_id"], params["client_msg_id"], params["user_uid"],
                 params["sender_role"], params["message_type"], params["kind"], params["content"],
                 params.get("goods_json"), params.get("size_json"), params["raw_json"], params["message_at"],
+                params.get("status") or "received",
             ],
         )
 
