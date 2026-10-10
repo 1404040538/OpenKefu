@@ -51,6 +51,48 @@ from openkefu.web.runtime_bus import RuntimeCommandBus
 from openkefu.web.runtime.shop_runner import PasswordVerificationRequired, ShopRunner
 
 
+def _worker_local_pid(worker_id: str) -> int | None:
+    """从默认 worker_id（<hostname>-<pid>-<hex>）解出本机 pid；格式不符或
+    跨机 worker 返回 None。hostname 自身可含 '-'，从右侧固定取两段。"""
+    if not worker_id:
+        return None
+    parts = worker_id.rsplit("-", 2)
+    if len(parts) != 3 or not parts[1].isdigit():
+        return None
+    hostname = parts[0]
+    if hostname != socket.gethostname():
+        return None
+    return int(parts[1])
+
+
+def _is_local_pid_alive(pid: int) -> bool:
+    """本机 pid 存活检查；Windows 下同时校验映像名以规避 pid 复用误判。"""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            size = ctypes.c_ulong(512)
+            buf = ctypes.create_unicode_buffer(512)
+            if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                image = (buf.value or "").lower()
+                if "python" not in image:
+                    return False  # pid 被无关进程复用
+            return True
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 class ShopRuntimeManager:
     STARTUP_RECONNECT_GRACE_SECONDS = 15
     # recovery 接管缓冲：必须远小于 stale cleanup 的 grace，
@@ -210,14 +252,24 @@ class ShopRuntimeManager:
                 return True
             if not required:
                 return False
+            row = self.repos.shops.lease_row(shop_id) or {}
+            holder = str(row.get("worker_id") or "")
+            # 同机另一个存活实例正持有租约且在续期——等待注定超时
+            # （多实例并存还会导致千牛同账号互踢），立即失败并给出处置指引
+            holder_pid = _worker_local_pid(holder)
+            if holder_pid is not None and _is_local_pid_alive(holder_pid):
+                raise RuntimeError(
+                    f"店铺运行锁由本机另一个服务实例持有（PID {holder_pid}）。"
+                    f"多实例并存会导致连接互踢，请先结束它：taskkill /PID {holder_pid} /F，"
+                    f"或直接在该实例的网页里操作。"
+                )
             remaining = self.repos.shops.lease_remaining_seconds(shop_id)
             if remaining is None or remaining <= 0:
                 # 无租约或已过期却仍获取失败（如恰好被并发抢占），短暂等待后重试
                 remaining = 3.0
             if time.monotonic() + remaining > deadline:
-                row = self.repos.shops.lease_row(shop_id) or {}
                 raise RuntimeError(
-                    f"店铺运行锁被其他实例持有（worker={row.get('worker_id') or '?'}），"
+                    f"店铺运行锁被其他实例持有（worker={holder or '?'}），"
                     f"其租约约 {int(remaining)} 秒后过期；请稍后重试"
                 )
             self.runtime_logger.log(
@@ -226,7 +278,8 @@ class ShopRuntimeManager:
                 "runtime.lease.wait",
                 "waiting for previous worker lease to expire",
                 shop_id=shop_id,
-                context={"remaining_seconds": int(remaining), "worker_id": self.worker_id},
+                context={"remaining_seconds": int(remaining), "holder": holder,
+                         "worker_id": self.worker_id},
             )
             time.sleep(min(remaining + 1.0, 5.0))
 

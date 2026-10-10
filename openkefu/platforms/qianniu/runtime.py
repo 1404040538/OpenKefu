@@ -241,9 +241,16 @@ class QianniuShopRunner:
         return {"success": True, "message_id": result.get("messageId"), "url": image_url}
 
     def online(self) -> dict[str, Any]:
-        row = self._shop_row()
         if self.im_client and self.im_client.status == "online":
-            return {"status": "online", "shop": row}
+            # 已在线：显式回写店铺状态——mark_online 挂在状态回调上，
+            # 连接早已建立时回调不会再触发，店铺会停留在 idle/offline
+            # （idle 店铺进程崩溃后 recovery 不会接管）
+            try:
+                self.repos.shops.mark_online(self.shop_id, mall_id=self.mall_id or "",
+                                             nickname=self.nick)
+            except Exception:
+                logger.exception("qianniu mark_online failed")
+            return {"status": "online", "shop": self._shop_row()}
         self._connect_from_cache()
         # 连接是后台线程建立的：等待终态（online / stop / 缓存缺失），
         # 避免立即返回 "closed" 造成"上线没生效"的误判
@@ -255,7 +262,8 @@ class QianniuShopRunner:
             if client.status == "online":
                 break
             time.sleep(0.5)
-        return {"status": self.im_client.status if self.im_client else "offline", "shop": row}
+        return {"status": self.im_client.status if self.im_client else "offline",
+                "shop": self._shop_row()}
 
     def has_live_connection(self) -> bool:
         """本进程是否仍持有该店铺的活连接（stale cleanup 的豁免判定）。"""

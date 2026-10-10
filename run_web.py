@@ -27,6 +27,38 @@ def check_port_free(host: str, port: int) -> None:
             raise SystemExit(1)
 
 
+def warn_sibling_instances(config, role: str) -> None:
+    """检测本机是否还有其他活着的 worker 实例（持有店铺租约）。
+
+    同机多实例会导致：店铺租约互抢（上线一直等待/失败）与千牛同账号
+    WSS 互踢（连接反复断开）。api 角色不持租约，不参与判定。
+    """
+    if role not in {"worker", "both"}:
+        return
+    try:
+        from openkefu.web.db import Database
+        from openkefu.web.runtime.manager import _is_local_pid_alive, _worker_local_pid
+        db = Database(config)
+        rows = db.query(
+            "SELECT DISTINCT worker_id FROM shop_runtime_leases WHERE status='online'"
+        )
+        siblings = []
+        for row in rows:
+            pid = _worker_local_pid(str(row.get("worker_id") or ""))
+            if pid is not None and pid != os.getpid() and _is_local_pid_alive(pid):
+                siblings.append(pid)
+        if siblings:
+            pids = ", ".join(str(p) for p in sorted(set(siblings)))
+            print(
+                f"[startup] 警告：检测到本机另一个运行中的服务实例（PID {pids}）"
+                f"持有店铺租约。多实例并存会导致店铺无法上线与连接互踢；"
+                f"如非有意部署多角色，请先结束它：taskkill /PID {pids.split(', ')[0]} /F",
+                file=sys.stderr,
+            )
+    except Exception as exc:  # 检测失败不阻断启动
+        print(f"[startup] sibling instance check skipped: {exc}", file=sys.stderr)
+
+
 def frontend_build_issue(frontend_dist: str, *, project_root: Path = PROJECT_ROOT) -> str | None:
     dist = Path(frontend_dist)
     if not dist.is_absolute():
@@ -94,13 +126,15 @@ def main():
     else:
         port = int(os.getenv("OPENKEFU_DEV_BACKEND_PORT", "8001"))
 
-    check_port_free(config.server.host, port)
     role = os.environ.get("OPENKEFU_RUNTIME_ROLE") or config.runtime.role
     print(
         f"[startup] mode={mode} role={role} pid={os.getpid()} "
         f"binding={config.server.host}:{port} db={config.mysql.database} "
         f"redis_db={'-'} lease_ttl={config.runtime.lease_ttl_seconds}s"
     )
+    # 兄弟实例警告先于端口预检：即使端口被占，也能指出真正的冲突来源
+    warn_sibling_instances(config, role)
+    check_port_free(config.server.host, port)
 
     if prod_like_mode:
         build_issue = frontend_build_issue(config.server.frontend_dist)
