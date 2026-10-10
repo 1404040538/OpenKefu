@@ -21,7 +21,9 @@ REPLY_CHANNEL_PREFIX = "openkefu:runtime_replies:"
 
 
 def make_redis_client(url: str) -> redis.Redis:
-    return redis.Redis.from_url(url, decode_responses=True, health_check_interval=30)
+    # protocol=2（RESP2）：显式指定可兼容 Redis <6.0（旧版服务端不支持 RESP3 的
+    # HELLO 握手命令；redis-py 8.x 未指定 protocol 时连接即发 HELLO 会直接报错）。
+    return redis.Redis.from_url(url, decode_responses=True, health_check_interval=30, protocol=2)
 
 
 class RuntimeCommandBus:

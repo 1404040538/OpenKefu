@@ -55,7 +55,7 @@ class LocalApiE2ETest(unittest.TestCase):
 
         response = cls.client.post(
             "/api/auth/setup-admin",
-            json={"username": "e2e_admin", "password": "Admin123!", "display_name": "E2E Admin"},
+            json={"username": "e2e_admin", "password": "Admin123!E2E!", "display_name": "E2E Admin"},
         )
         cls._assert_response(response, 200)
         cls.admin_token = response.json()["token"]
@@ -173,7 +173,7 @@ class LocalApiE2ETest(unittest.TestCase):
             headers=self.admin_headers,
             json={
                 "username": "e2e_service",
-                "password": "Service123!",
+                "password": "Service123!E2E!",
                 "display_name": "E2E Service",
                 "role": "service",
                 "shop_ids": [shop_id],
@@ -183,7 +183,7 @@ class LocalApiE2ETest(unittest.TestCase):
         service_user_id = int(response.json()["id"])
         response = self.client.post(
             "/api/auth/login",
-            json={"username": "e2e_service", "password": "Service123!"},
+            json={"username": "e2e_service", "password": "Service123!E2E!"},
         )
         self._assert_response(response, 200)
         service_headers = {"Authorization": f"Bearer {response.json()['token']}"}
@@ -265,9 +265,10 @@ class LocalApiE2ETest(unittest.TestCase):
 
         self._assert_response(self.client.get("/api/logs", headers=self.admin_headers), 200)
         self._assert_response(self.client.get("/api/runtime/workers", headers=self.admin_headers), 200)
-        self._assert_response(self.client.get("/api/server-status/latest", headers=self.admin_headers), 200)
+        # 服务器状态监控已移除：端点应返回 404
+        self._assert_response(self.client.get("/api/server-status/latest", headers=self.admin_headers), 404)
         self._assert_response(
-            self.client.get("/api/server-status/history?range=1h", headers=self.admin_headers), 200
+            self.client.get("/api/server-status/history?range=1h", headers=self.admin_headers), 404
         )
 
         self._assert_response(
